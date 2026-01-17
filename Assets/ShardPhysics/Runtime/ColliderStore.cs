@@ -191,13 +191,19 @@ namespace Shard
             return new ColliderHandle(slot, header.Version);
         }
 
-        public ColliderHandle CreateCapsule(float radius, float halfHeight, float3 center, ushort materialId = 0, ushort flags = 0)
+        public ColliderHandle CreateCapsule(float radius, float halfHeight, float3 center, quaternion orientation, ushort materialId = 0, ushort flags = 0)
         {
             int slot = AllocateSlot();
             ref var header = ref Slots.ElementAt(slot).Header;
 
             int payloadIndex = Capsules.Length;
-            var p = new CapsuleCollider { Radius = radius, HalfHeight = halfHeight, Center = center };
+            var p = new CapsuleCollider
+            {
+                Radius = radius,
+                HalfHeight = halfHeight,
+                Center = center,
+                Orientation = orientation
+            };
             Capsules.Add(p);
 
             header.Type = ColliderType.Capsule;
@@ -208,6 +214,7 @@ namespace Shard
 
             return new ColliderHandle(slot, header.Version);
         }
+
 
         public ColliderHandle CreateBox(float3 halfExtents, float3 center, quaternion orientation, ushort materialId = 0, ushort flags = 0)
         {
@@ -437,8 +444,12 @@ namespace Shard
         {
             float r = math.max(0f, c.Radius);
             float hy = math.max(0f, c.HalfHeight);
-            return Aabb.FromCenterExtents(c.Center, new float3(r, hy + r, r));
+
+            // Capsule axis is local +Y before Orientation
+            float3 ext = new float3(r, hy + r, r);
+            return AabbForOrientedExtents(c.Center, c.Orientation, ext);
         }
+
 
         private static Aabb ComputeBoxLocalAabb(in BoxCollider b)
         {
