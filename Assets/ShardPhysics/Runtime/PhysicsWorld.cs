@@ -1,4 +1,6 @@
+using Unity.Burst;
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
 
 namespace Shard
@@ -216,73 +218,137 @@ namespace Shard
                 Broadphase.UpdateProxy(proxy, worldAabb);
         }
 
-        public void Step(float dt, float3 gravity)
+        public JobHandle Step(float dt, float3 gravity, JobHandle deps = default)
         {
-            // Super-simple single-thread step for now.
-            // Later we’ll convert to Burst jobs and return JobHandle.
+            // Ensure proxy buffers can hold all bodies (proxyId == body index for now)
+            Broadphase.EnsureBodyCapacity(Bodies.Length);
 
-            for (int i = 0; i < Bodies.Length; i++)
+            var integrate = new IntegrateJob
             {
-                if (BodyAlive[i] == 0)
-                    continue;
+                Dt = dt,
+                Gravity = gravity,
+                BodyAlive = BodyAlive.AsArray(),
+                Bodies = Bodies.AsArray(),
+                Poses = Poses.AsArray(),
+                Velocities = Velocities.AsArray(),
+                Masses = Masses.AsArray(),
+                Dampings = Dampings.AsArray()
+            };
 
-                // Skip freed slots (removed bodies). We detect them by invalid collider + static defaults.
-                // If you later add an "IsAlive" flag for bodies, use that instead.
-                // For now: if it has no proxy and collider invalid and mass is default, it's probably empty.
-                // (This is just for early scaffolding.)
-                var body = Bodies[i];
+            // Batch size: tune later
+            JobHandle h1 = integrate.ScheduleParallel(Bodies.Length, 64, deps);
 
-                if (!body.Collider.IsValid || !Colliders.IsValid(body.Collider))
-                    continue;
+            var update = new UpdateProxiesJob
+            {
+                BodyAlive = BodyAlive.AsArray(),
+                Bodies = Bodies.AsArray(),
+                Poses = Poses.AsArray(),
+                ColliderSlots = Colliders.Slots.AsArray(),
 
-                if (body.MotionType != MotionType.Dynamic)
-                {
-                    // Still update proxy if kinematic pose changed externally
-                    SyncProxyForBody(new BodyId(i));
-                    continue;
-                }
+                BodyToProxy = Broadphase.BodyToProxy.AsArray(),
+                ProxyAabbs = Broadphase.ProxyAabbs.AsArray()
+            };
 
-                // Integrate velocities
-                var v = Velocities[i];
-                var m = Masses[i];
-                var d = Dampings[i];
-
-                if (m.InverseMass > 0f)
-                {
-                    v.Linear += gravity * dt;
-                }
-
-                // Damping (simple exponential-ish approximation)
-                float linDamp = math.max(0f, 1f - d.Linear * dt);
-                float angDamp = math.max(0f, 1f - d.Angular * dt);
-                v.Linear *= linDamp;
-                v.Angular *= angDamp;
-
-                Velocities[i] = v;
-
-                // Integrate pose (Euler)
-                var p = Poses[i];
-                p.Position += v.Linear * dt;
-
-                // Angular integration (small-angle quaternion)
-                float3 w = v.Angular;
-                float wLen = math.length(w);
-
-                if (wLen > 0f)
-                {
-                    float3 axis = w / wLen;
-                    quaternion dq = quaternion.AxisAngle(axis, wLen * dt);
-                    p.Rotation = math.normalize(math.mul(p.Rotation, dq));
-                }
-
-                Poses[i] = p;
-
-                // Update broadphase proxy
-                SyncProxyForBody(new BodyId(i));
-            }
+            JobHandle h2 = update.ScheduleParallel(Bodies.Length, 64, h1);
+            return h2;
         }
+    }
 
 
+    [BurstCompile]
+    internal struct IntegrateJob : IJobFor
+    {
+        public float Dt;
+        public float3 Gravity;
 
+        [ReadOnly] public NativeArray<byte> BodyAlive;
+        [ReadOnly] public NativeArray<Body> Bodies;
+
+        public NativeArray<Pose> Poses;
+        public NativeArray<Velocity> Velocities;
+        [ReadOnly] public NativeArray<MassProperties> Masses;
+        [ReadOnly] public NativeArray<Damping> Dampings;
+
+        public void Execute(int i)
+        {
+            if (BodyAlive[i] == 0) return;
+
+            var body = Bodies[i];
+            if (body.MotionType != MotionType.Dynamic) return;
+
+            var v = Velocities[i];
+            var m = Masses[i];
+            var d = Dampings[i];
+
+            if (m.InverseMass > 0f)
+                v.Linear += Gravity * Dt;
+
+            float linDamp = math.max(0f, 1f - d.Linear * Dt);
+            float angDamp = math.max(0f, 1f - d.Angular * Dt);
+            v.Linear *= linDamp;
+            v.Angular *= angDamp;
+
+            Velocities[i] = v;
+
+            var p = Poses[i];
+            p.Position += v.Linear * Dt;
+
+            float3 w = v.Angular;
+            float wLen = math.length(w);
+            if (wLen > 0f)
+            {
+                float3 axis = w / wLen;
+                quaternion dq = quaternion.AxisAngle(axis, wLen * Dt);
+                p.Rotation = math.normalize(math.mul(p.Rotation, dq));
+            }
+
+            Poses[i] = p;
+        }
+    }
+
+    [BurstCompile]
+    internal struct UpdateProxiesJob : IJobFor
+    {
+        [ReadOnly] public NativeArray<byte> BodyAlive;
+        [ReadOnly] public NativeArray<Body> Bodies;
+        [ReadOnly] public NativeArray<Pose> Poses;
+
+        [ReadOnly] public NativeArray<ColliderSlot> ColliderSlots;
+
+        public NativeArray<int> BodyToProxy;
+        public NativeArray<Aabb> ProxyAabbs;
+
+        public void Execute(int i)
+        {
+            if (BodyAlive[i] == 0) return;
+
+            var body = Bodies[i];
+            int proxy = BodyToProxy[i];
+
+            // Validate collider handle without calling ColliderStore methods (Burst-safe)
+            if ((uint)body.Collider.Slot >= (uint)ColliderSlots.Length)
+            {
+                BodyToProxy[i] = -1;
+                return;
+            }
+
+            var slot = ColliderSlots[body.Collider.Slot];
+            if (slot.IsAlive == 0 || slot.Header.Version != body.Collider.Version)
+            {
+                if (proxy != -1) BodyToProxy[i] = -1;
+                return;
+            }
+
+            Aabb worldAabb = WorldAabb.FromBodyPose(slot.Header.LocalAabb, Poses[i]);
+
+            if (proxy == -1)
+            {
+                // placeholder proxy id == body id
+                proxy = i;
+                BodyToProxy[i] = proxy;
+            }
+
+            ProxyAabbs[proxy] = worldAabb;
+        }
     }
 }
