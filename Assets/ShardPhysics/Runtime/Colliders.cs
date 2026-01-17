@@ -13,6 +13,7 @@ namespace Shard
         public float Radius;
         public float HalfHeight; // along local Y (starter)
         public float3 Center;    // local
+        public quaternion Orientation; // local box rotation
     }
 
     public struct BoxCollider
