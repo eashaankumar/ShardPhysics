@@ -1,0 +1,16 @@
+{
+    "name": "ShardPhysicsSamples",
+    "rootNamespace": "Shard.Samples",
+    "references": [
+        "GUID:1c3aad6896b5a0842b885101d64ba15d"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

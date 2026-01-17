@@ -22,7 +22,7 @@ namespace Shard
         public byte IsAlive;
     }
 
-    public struct Material
+    public struct PhysicsMaterial
     {
         public float Friction;
         public float Restitution;
