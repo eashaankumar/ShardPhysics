@@ -5,8 +5,6 @@ namespace Shard
 {
     internal struct Broadphase : System.IDisposable
     {
-        // Dynamic tree, static tree, proxy mapping, etc.
-        // Proxies map BodyId -> tree leaf id
         public NativeList<int> BodyToProxy;
 
         public Broadphase(Allocator allocator)
@@ -15,6 +13,39 @@ namespace Shard
         }
 
         public void Dispose() => BodyToProxy.Dispose();
+
+        public void EnsureBodyCapacity(int bodyCount)
+        {
+            while (BodyToProxy.Length < bodyCount)
+                BodyToProxy.Add(-1);
+        }
+
+        public int CreateProxy(BodyId bodyId, in Aabb worldAabb)
+        {
+            EnsureBodyCapacity(bodyId.Value + 1);
+
+            // Placeholder: proxy id == body id
+            int proxyId = bodyId.Value;
+            BodyToProxy[bodyId.Value] = proxyId;
+
+            // Future: insert into dynamic/static tree here using worldAabb.
+            _ = worldAabb;
+
+            return proxyId;
+        }
+
+        public void UpdateProxy(int proxyId, in Aabb worldAabb)
+        {
+            // Future: update leaf bounds in tree.
+            _ = proxyId;
+            _ = worldAabb;
+        }
+
+        public void RemoveProxy(int proxyId)
+        {
+            // Future: remove from tree.
+            _ = proxyId;
+        }
     }
 
     internal struct Narrowphase : System.IDisposable

@@ -18,6 +18,7 @@ namespace Shard
         internal NativeList<Velocity> Velocities;
         internal NativeList<MassProperties> Masses;
         internal NativeList<Damping> Dampings;
+        internal NativeList<byte> BodyAlive; // 0 = free, 1 = alive
 
         // Bookkeeping
         internal NativeList<int> FreeBodySlots; // free-list for BodyId reuse
@@ -54,6 +55,8 @@ namespace Shard
             Constraints = new ConstraintGraph(allocator);
             Solver = new Solver(allocator);
 
+            BodyAlive = new NativeList<byte>(bodyCapacity, allocator);
+
             Scratch = new RewindableAllocator();
             const int scratchBytes = 256 * 1024;
             Scratch.Initialize(scratchBytes);
@@ -75,6 +78,8 @@ namespace Shard
             Velocities.Dispose();
             Poses.Dispose();
             Bodies.Dispose();
+
+            BodyAlive.Dispose();
         }
 
         // -------------------------
@@ -88,6 +93,7 @@ namespace Shard
             {
                 index = FreeBodySlots[^1];
                 FreeBodySlots.RemoveAtSwapBack(FreeBodySlots.Length - 1);
+                BodyAlive[index] = 1;
             }
             else
             {
@@ -98,6 +104,7 @@ namespace Shard
                 Velocities.Add(default);
                 Masses.Add(default);
                 Dampings.Add(default);
+                BodyAlive.Add(1);
 
                 m_bodyCount++;
             }
@@ -142,6 +149,8 @@ namespace Shard
             if (!id.IsValid || (uint)id.Value >= (uint)Bodies.Length)
                 return;
 
+            BodyAlive[id.Value] = 0;
+
             // Placeholder proxy removal
             EnsureBroadphaseCapacity(id.Value + 1);
             Broadphase.BodyToProxy[id.Value] = -1;
@@ -176,35 +185,104 @@ namespace Shard
 
         private void EnsureBroadphaseCapacity(int bodyCount)
         {
-            // Ensure BodyToProxy has an entry for every body slot.
-            while (Broadphase.BodyToProxy.Length < bodyCount)
-                Broadphase.BodyToProxy.Add(-1);
+            Broadphase.EnsureBodyCapacity(bodyCount);
         }
 
         private void SyncProxyForBody(BodyId id)
         {
-            EnsureBroadphaseCapacity(id.Value + 1);
+            Broadphase.EnsureBodyCapacity(id.Value + 1);
 
             var body = Bodies[id.Value];
+
+            int proxy = Broadphase.BodyToProxy[id.Value];
+
+            // If collider invalid, remove proxy if it exists
             if (!Colliders.IsValid(body.Collider))
             {
-                Broadphase.BodyToProxy[id.Value] = -1;
+                if (proxy != -1)
+                {
+                    Broadphase.RemoveProxy(proxy);
+                    Broadphase.BodyToProxy[id.Value] = -1;
+                }
                 return;
             }
 
-            // Compute world AABB using your step (2) helper.
             ref var header = ref Colliders.Resolve(body.Collider);
             Aabb worldAabb = WorldAabb.FromBodyPose(header.LocalAabb, Poses[id.Value]);
 
-            // Placeholder: proxy id == body id
-            int proxy = Broadphase.BodyToProxy[id.Value];
             if (proxy == -1)
-                Broadphase.BodyToProxy[id.Value] = id.Value;
-
-            // Step 4 will replace this with real Broadphase.CreateProxy / UpdateProxy.
-            // For now we just ensure the proxy exists and worldAabb computes cleanly.
-            _ = worldAabb;
+                Broadphase.CreateProxy(id, worldAabb);
+            else
+                Broadphase.UpdateProxy(proxy, worldAabb);
         }
+
+        public void Step(float dt, float3 gravity)
+        {
+            // Super-simple single-thread step for now.
+            // Later we’ll convert to Burst jobs and return JobHandle.
+
+            for (int i = 0; i < Bodies.Length; i++)
+            {
+                if (BodyAlive[i] == 0)
+                    continue;
+
+                // Skip freed slots (removed bodies). We detect them by invalid collider + static defaults.
+                // If you later add an "IsAlive" flag for bodies, use that instead.
+                // For now: if it has no proxy and collider invalid and mass is default, it's probably empty.
+                // (This is just for early scaffolding.)
+                var body = Bodies[i];
+
+                if (!body.Collider.IsValid || !Colliders.IsValid(body.Collider))
+                    continue;
+
+                if (body.MotionType != MotionType.Dynamic)
+                {
+                    // Still update proxy if kinematic pose changed externally
+                    SyncProxyForBody(new BodyId(i));
+                    continue;
+                }
+
+                // Integrate velocities
+                var v = Velocities[i];
+                var m = Masses[i];
+                var d = Dampings[i];
+
+                if (m.InverseMass > 0f)
+                {
+                    v.Linear += gravity * dt;
+                }
+
+                // Damping (simple exponential-ish approximation)
+                float linDamp = math.max(0f, 1f - d.Linear * dt);
+                float angDamp = math.max(0f, 1f - d.Angular * dt);
+                v.Linear *= linDamp;
+                v.Angular *= angDamp;
+
+                Velocities[i] = v;
+
+                // Integrate pose (Euler)
+                var p = Poses[i];
+                p.Position += v.Linear * dt;
+
+                // Angular integration (small-angle quaternion)
+                float3 w = v.Angular;
+                float wLen = math.length(w);
+
+                if (wLen > 0f)
+                {
+                    float3 axis = w / wLen;
+                    quaternion dq = quaternion.AxisAngle(axis, wLen * dt);
+                    p.Rotation = math.normalize(math.mul(p.Rotation, dq));
+                }
+
+                Poses[i] = p;
+
+                // Update broadphase proxy
+                SyncProxyForBody(new BodyId(i));
+            }
+        }
+
+
 
     }
 }
