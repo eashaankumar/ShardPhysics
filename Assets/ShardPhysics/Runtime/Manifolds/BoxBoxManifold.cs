@@ -1,11 +1,25 @@
-﻿using UnityEngine;
+﻿using System.Runtime.CompilerServices;
+using UnityEngine;
 
 namespace Shard.Manifolds
 {
     using Unity.Mathematics;
-        
+
+    // SAT-case driven OBB-OBB manifold:
+    // - SAT decides *which feature pair* (FaceA / FaceB / EdgeEdge) is responsible for minimum penetration.
+    // - Face cases: reference face is that SAT face (no heuristics), incident face is the most anti-parallel face on the other box,
+    //   then clip incident quad against the 4 side planes of the reference face.
+    // - EdgeEdge case: pick extreme edges and do segment-segment closest points -> 1 contact.
+    //
+    // Assumptions (matching your snippet):
+    // Pose.Position : float3, Pose.Rotation : quaternion
+    // BoxCollider.Center : float3, BoxCollider.Orientation : quaternion, BoxCollider.HalfExtents : float3
     internal static class BoxBoxManifold
     {
+        private const float kEps = 1e-6f;
+        private const float kParallelAxisLenSq = 1e-10f;
+        private const float kPlaneSlop = 1e-6f;
+
         // -------------------------
         // Public API
         // -------------------------
@@ -18,70 +32,133 @@ namespace Shard.Manifolds
             GetBoxWorld(a, aPose, out float3 aC, out quaternion aR, out float3 aE);
             GetBoxWorld(b, bPose, out float3 bC, out quaternion bR, out float3 bE);
 
-            float3x3 A = new float3x3(aR);
+            float3x3 A = new float3x3(aR); // columns are world axes
             float3x3 B = new float3x3(bR);
 
+            // SAT: normal (A->B), penetration depth, and winning axis identity
+            if (!SatCase(aC, A, aE, bC, B, bE, out SatHit hit))
+                return false;
+
+            m.Normal = hit.N;
+
+            if (hit.Kind == AxisKind.EdgeEdge)
+            {
+                // Edge-edge: i = axis on A, j = axis on B
+                BuildEdgeEdge(aC, A, aE, bC, B, bE, hit.I, hit.J, hit.N, hit.Depth, ref m);
+                return m.PointCount > 0;
+            }
+
+            // FaceA(i): ref=A, inc=B
+            // FaceB(j): ref=B, inc=A (but manifold normal stays A->B; do NOT flip m.Normal)
+            if (hit.Kind == AxisKind.FaceA)
+                BuildFace(refBoxIsA: true, aC, A, aE, bC, B, bE, hit.I, hit.N, hit.Depth, ref m);
+            else
+                BuildFace(refBoxIsA: false, bC, B, bE, aC, A, aE, hit.I, hit.N, hit.Depth, ref m);
+
+            // If clipping degenerates (rare), fall back to a single stable point.
+            if (m.PointCount == 0)
+            {
+                float3 pA = SupportPoint(aC, A, aE, +hit.N);
+                float3 pB = SupportPoint(bC, B, bE, -hit.N);
+                float3 cp = 0.5f * (pA + pB);
+                AddPoint(ref m, cp, hit.Depth, 20u);
+            }
+
+            m.Normal = hit.N;
+            return m.PointCount > 0;
+        }
+
+        // -------------------------
+        // SAT case
+        // -------------------------
+        private enum AxisKind : byte { FaceA, FaceB, EdgeEdge }
+
+        private struct SatHit
+        {
+            public AxisKind Kind;
+            public int I;     // Face axis index (0..2) OR edge axis i for EdgeEdge
+            public int J;     // edge axis j for EdgeEdge
+            public float3 N;  // normalized, points A -> B
+            public float Depth;
+        }
+
+        private static bool SatCase(float3 aC, in float3x3 A, float3 aE,
+                                    float3 bC, in float3x3 B, float3 bE,
+                                    out SatHit hit)
+        {
             float3 tW = bC - aC;
 
+            // translation in each local frame
             float3 tA = new float3(math.dot(tW, A.c0), math.dot(tW, A.c1), math.dot(tW, A.c2));
             float3 tB = new float3(math.dot(tW, B.c0), math.dot(tW, B.c1), math.dot(tW, B.c2));
 
+            // R = A^T * B (column-major)
             float3x3 R = new float3x3(
-                math.dot(A.c0, B.c0), math.dot(A.c0, B.c1), math.dot(A.c0, B.c2),
-                math.dot(A.c1, B.c0), math.dot(A.c1, B.c1), math.dot(A.c1, B.c2),
-                math.dot(A.c2, B.c0), math.dot(A.c2, B.c1), math.dot(A.c2, B.c2)
+                new float3(math.dot(A.c0, B.c0), math.dot(A.c1, B.c0), math.dot(A.c2, B.c0)),
+                new float3(math.dot(A.c0, B.c1), math.dot(A.c1, B.c1), math.dot(A.c2, B.c1)),
+                new float3(math.dot(A.c0, B.c2), math.dot(A.c1, B.c2), math.dot(A.c2, B.c2))
             );
 
             float3x3 AbsR = new float3x3(
-                math.abs(R.c0) + 1e-6f,
-                math.abs(R.c1) + 1e-6f,
-                math.abs(R.c2) + 1e-6f
+                math.abs(R.c0) + kEps,
+                math.abs(R.c1) + kEps,
+                math.abs(R.c2) + kEps
             );
 
-            // Drop this into your BoxBoxManifold (replace the "best axis" selection block).
-            // It splits bestFace vs bestEdge, and biases toward face contacts when edge-edge only barely wins.
+            // Bias edge-edge slightly so face wins when nearly equal (stability)
+            float minHalfExtent = math.cmin(math.min(aE, bE));
+            float edgeBias = 2e-3f * (minHalfExtent * 2f);
 
-            AxisChoice bestFace = default; bestFace.MinPen = float.PositiveInfinity;
-            AxisChoice bestEdge = default; bestEdge.MinPen = float.PositiveInfinity;
+            float bestPen = float.PositiveInfinity;
+            AxisKind bestKind = AxisKind.FaceA;
+            int bestI = 0, bestJ = 0;
+            float3 bestAxis = new float3(0, 1, 0);
 
-            // Face axes A
+            // --- Face axes A[i] ---
             for (int i = 0; i < 3; i++)
             {
                 float ra = aE[i];
-                float rb = bE.x * AbsR[i][0] + bE.y * AbsR[i][1] + bE.z * AbsR[i][2];
+                float rb = bE.x * Mij(AbsR, i, 0) + bE.y * Mij(AbsR, i, 1) + bE.z * Mij(AbsR, i, 2);
 
                 float dist = math.abs(tA[i]);
                 float pen = (ra + rb) - dist;
-                if (pen < 0f) return false;
+                if (pen < 0f) { hit = default; return false; }
 
-                float sign = (tA[i] < 0f) ? -1f : 1f;
-                float3 axisW = A[i] * sign;
+                float3 axis = A[i];
+                if (math.dot(axis, tW) < 0f) axis = -axis; // point A->B
 
-                Consider(ref bestFace, pen, axisW, AxisKind.FaceA, i, 0, sign, tW);
+                if (pen < bestPen)
+                {
+                    bestPen = pen;
+                    bestKind = AxisKind.FaceA;
+                    bestI = i; bestJ = 0;
+                    bestAxis = axis;
+                }
             }
 
-            // Face axes B
-            for (int i = 0; i < 3; i++)
+            // --- Face axes B[j] ---
+            for (int j = 0; j < 3; j++)
             {
-                float ra = aE.x * AbsR[0][i] + aE.y * AbsR[1][i] + aE.z * AbsR[2][i];
-                float rb = bE[i];
+                float ra = aE.x * Mij(AbsR, 0, j) + aE.y * Mij(AbsR, 1, j) + aE.z * Mij(AbsR, 2, j);
+                float rb = bE[j];
 
-                float dist = math.abs(tB[i]);
+                float dist = math.abs(tB[j]);
                 float pen = (ra + rb) - dist;
-                if (pen < 0f) return false;
+                if (pen < 0f) { hit = default; return false; }
 
-                float sign = (tB[i] < 0f) ? -1f : 1f;
-                float3 axisW = B[i] * sign;
+                float3 axis = B[j];
+                if (math.dot(axis, tW) < 0f) axis = -axis; // point A->B
 
-                Consider(ref bestFace, pen, axisW, AxisKind.FaceB, i, 0, sign, tW);
+                if (pen < bestPen)
+                {
+                    bestPen = pen;
+                    bestKind = AxisKind.FaceB;
+                    bestI = j; bestJ = 0;
+                    bestAxis = axis;
+                }
             }
 
-            // Cross (edge-edge) axes
-            // Add a small "edge penalty" so face wins unless edge-edge is meaningfully better.
-            float minHalfExtent = math.cmin(math.min(aE, bE));     // smallest half extent across both boxes
-            float edgeBias = 1e-3f * (minHalfExtent * 2f);         // ~0.1% of smallest box dimension
-                                                                   // You can bump to 2e-3f if you still see flips.
-
+            // --- Cross axes A[i] x B[j] ---
             for (int i = 0; i < 3; i++)
             {
                 int i1 = (i + 1) % 3;
@@ -89,93 +166,106 @@ namespace Shard.Manifolds
 
                 for (int j = 0; j < 3; j++)
                 {
-                    float3 axisWraw = math.cross(A[i], B[j]);
-                    float axisLenSq = math.lengthsq(axisWraw);
-                    if (axisLenSq < 1e-8f) continue;
+                    float3 axisRaw = math.cross(A[i], B[j]);
+                    float lenSq = math.lengthsq(axisRaw);
+                    if (lenSq < kParallelAxisLenSq) continue;
 
                     int j1 = (j + 1) % 3;
                     int j2 = (j + 2) % 3;
 
-                    float ra = aE[i1] * AbsR[i2][j] + aE[i2] * AbsR[i1][j];
-                    float rb = bE[j1] * AbsR[i][j2] + bE[j2] * AbsR[i][j1];
+                    float ra = aE[i1] * Mij(AbsR, i2, j) + aE[i2] * Mij(AbsR, i1, j);
+                    float rb = bE[j1] * Mij(AbsR, i, j2) + bE[j2] * Mij(AbsR, i, j1);
 
-                    float dist = math.abs(tA[i2] * R[i1][j] - tA[i1] * R[i2][j]);
+                    float dist = math.abs(tA[i2] * Mij(R, i1, j) - tA[i1] * Mij(R, i2, j));
                     float pen = (ra + rb) - dist;
-                    if (pen < 0f) return false;
+                    if (pen < 0f) { hit = default; return false; }
 
-                    float3 axisW = axisWraw * math.rsqrt(axisLenSq);
-                    float sign = (math.dot(axisW, tW) < 0f) ? -1f : 1f;
-                    axisW *= sign;
+                    float3 axis = axisRaw * math.rsqrt(lenSq);
+                    if (math.dot(axis, tW) < 0f) axis = -axis; // point A->B
 
-                    // bias the penetration so edge-edge is less likely to win near face/face cases
-                    float penBiased = pen + edgeBias;
-
-                    Consider(ref bestEdge, penBiased, axisW, AxisKind.EdgeEdge, i, j, sign, tW);
+                    // Edge bias
+                    float biased = pen + edgeBias;
+                    if (biased < bestPen)
+                    {
+                        bestPen = biased;
+                        bestKind = AxisKind.EdgeEdge;
+                        bestI = i;
+                        bestJ = j;
+                        bestAxis = axis;
+                    }
                 }
             }
 
-            // Decide final best. Prefer face if close.
-            AxisChoice best = (bestFace.MinPen <= bestEdge.MinPen) ? bestFace : bestEdge;
+            // Output
+            float3 n = math.normalizesafe(bestAxis, new float3(0, 1, 0));
 
-            // Optional extra tolerance guard (in addition to the bias)
-            float tol = edgeBias;
-            if (best.Kind == AxisKind.EdgeEdge && bestFace.MinPen <= bestEdge.MinPen + tol)
-                best = bestFace;
-
-            // Use `best` from here onward exactly like you already do:
-            float3 n = math.normalizesafe(best.AxisW, new float3(0, 1, 0));
-            m.Normal = n;
-
-
-            if (best.Kind == AxisKind.EdgeEdge)
+            // Recover actual depth if best was edge-edge (bestPen contains bias)
+            float depth = bestPen;
+            if (bestKind == AxisKind.EdgeEdge)
             {
-                GetEdgeSegmentOnBox(aC, A, aE, best.I, -n, out float3 ea0, out float3 ea1);
-                GetEdgeSegmentOnBox(bC, B, bE, best.J, +n, out float3 eb0, out float3 eb1);
+                // recompute actual penetration for chosen (i,j) without bias
+                int i = bestI, j = bestJ;
+                int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
+                int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
 
-                ClosestPointsSegmentSegment(ea0, ea1, eb0, eb1, out float3 ca, out float3 cb);
-                float3 cp = 0.5f * (ca + cb);
-
-                AddPoint(ref m, cp, best.MinPen, 20u);
-                return true;
+                float ra = aE[i1] * Mij(AbsR, i2, j) + aE[i2] * Mij(AbsR, i1, j);
+                float rb = bE[j1] * Mij(AbsR, i, j2) + bE[j2] * Mij(AbsR, i, j1);
+                float dist = math.abs(tA[i2] * Mij(R, i1, j) - tA[i1] * Mij(R, i2, j));
+                depth = (ra + rb) - dist;
             }
 
-            // Face contact (clip)
-            bool refIsA = (best.Kind == AxisKind.FaceA);
-            int refAxis = best.I;
+            hit = new SatHit
+            {
+                Kind = bestKind,
+                I = bestI,
+                J = bestJ,
+                N = n,
+                Depth = depth
+            };
+            return true;
+        }
 
-            float3 refC = refIsA ? aC : bC;
-            float3x3 refM = refIsA ? A : B;
-            float3 refE = refIsA ? aE : bE;
+        // Column-major float3x3 access: row i, col j
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float Mij(in float3x3 M, int i, int j) => M[j][i];
 
-            float3 incC = refIsA ? bC : aC;
-            float3x3 incM = refIsA ? B : A;
-            float3 incE = refIsA ? bE : aE;
-
+        // -------------------------
+        // Face manifold (SAT-driven)
+        // -------------------------
+        private static void BuildFace(bool refBoxIsA,
+                                      float3 refC, in float3x3 refM, float3 refE,
+                                      float3 incC, in float3x3 incM, float3 incE,
+                                      int refAxis,
+                                      float3 nAtoB,
+                                      float depth,
+                                      ref ContactManifold m)
+        {
+            // Reference face normal is exactly ±refM[refAxis], aligned with manifold normal.
             float3 refAxisW = refM[refAxis];
+            float faceSign = (math.dot(refAxisW, nAtoB) >= 0f) ? 1f : -1f;
+            float3 refN = math.normalizesafe(refAxisW * faceSign, nAtoB);
 
-            // Pick the reference face normal that points the same way as the manifold normal (A->B)
-            float faceSign = (math.dot(refAxisW, n) >= 0f) ? 1f : -1f;
-
-            // CORRECT: reference planes use the actual reference face normal (axis-aligned in ref box space)
-            float3 refN = math.normalizesafe(refAxisW * faceSign, n);
-
-            // And the face center must be offset along THAT face normal, not along n
+            // Reference face center and tangents (in reference box frame)
             float3 refFaceCenter = refC + refN * refE[refAxis];
 
             int t0i = (refAxis + 1) % 3;
             int t1i = (refAxis + 2) % 3;
+
             float3 t0 = refM[t0i];
             float3 t1 = refM[t1i];
             float ext0 = refE[t0i];
             float ext1 = refE[t1i];
 
+            // Side planes of reference face rectangle (clip space is "inside" => SignedDistance >= 0)
             Plane4 side0 = PlaneFromPointNormal(refFaceCenter + t0 * ext0, -t0);
             Plane4 side1 = PlaneFromPointNormal(refFaceCenter - t0 * ext0, +t0);
             Plane4 side2 = PlaneFromPointNormal(refFaceCenter + t1 * ext1, -t1);
             Plane4 side3 = PlaneFromPointNormal(refFaceCenter - t1 * ext1, +t1);
 
+            // Reference plane for depth (keep points behind it)
             Plane4 refPlane = PlaneFromPointNormal(refFaceCenter, refN);
 
+            // Choose incident face on incident box: face whose normal is most anti-parallel to refN
             FindIncidentFace(incM, refN, out int incAxis, out float incSign);
             GetFaceQuad(incC, incM, incE, incAxis, incSign, out float3 v0, out float3 v1, out float3 v2, out float3 v3);
 
@@ -183,166 +273,135 @@ namespace Shard.Manifolds
             poly.Count = 4;
             poly.V0 = v0; poly.V1 = v1; poly.V2 = v2; poly.V3 = v3;
 
+            // Clip incident polygon against reference face side planes
             poly = ClipPoly(poly, side0);
             poly = ClipPoly(poly, side1);
             poly = ClipPoly(poly, side2);
             poly = ClipPoly(poly, side3);
 
-            if (poly.Count == 0) return false;
+            if (poly.Count == 0)
+                return;
 
-            uint fidBase = 100u + (uint)(refIsA ? 0 : 10) + (uint)refAxis * 2u + (uint)(faceSign > 0 ? 0 : 1);
-
+            // Build candidate points + depths
             Span8 cand = default;
-            Span8 candDepth = default; // store depths in .V0.x etc (hacky) OR use separate float array; see below.
-
-            int candCount = 0;
+            Span8 depths = default;
+            int count = 0;
 
             for (int i = 0; i < poly.Count; i++)
             {
-                float3 pW = poly[i];
-                float depth = -SignedDistance(refPlane, pW);
-                if (depth < 0f) continue;
+                float3 p = poly[i];
 
-                float3 cp = pW + refN * (0.5f * depth);
+                // depth relative to reference plane (positive means penetrating)
+                float d = -SignedDistance(refPlane, p);
+                if (d < -kPlaneSlop) continue;
 
-                cand[candCount] = cp;
-                // store depth in a parallel float4-like packing using float3.x
-                candDepth[candCount] = new float3(depth, 0, 0);
-                candCount++;
+                // Project point onto reference plane for stability
+                float3 cp = p + refN * d;
+
+                cand[count] = cp;
+                depths[count] = new float3(d, 0, 0);
+                count++;
+                if (count == 8) break;
             }
 
-            if (candCount == 0) return false;
+            if (count == 0)
+                return;
 
-            ReduceTo4_Spread(cand, candDepth, candCount, refN, fidBase, ref m);
+            // Reduce to <= 4 spread points in contact plane (plane normal is manifold normal)
+            // Using refN is OK here because refN is collinear with nAtoB in face case.
+            uint fidBase = 100u + (uint)(refBoxIsA ? 0 : 10) + (uint)(refAxis * 2) + (uint)(faceSign > 0 ? 0 : 1);
+            ReduceTo4_Spread(cand, depths, count, refN, fidBase, ref m);
 
+            // If still nothing (extreme degeneracy), add a single support-midpoint.
             if (m.PointCount == 0)
             {
-                float3 fallback = 0.5f * (aC + bC) - n * (0.5f * best.MinPen);
-                AddPoint(ref m, fallback, best.MinPen, 20u);
+                float3 fallback = refFaceCenter - refN * (0.5f * math.max(depth, 0f));
+                AddPoint(ref m, fallback, math.max(depth, 0f), 20u);
             }
-
-            m.Normal = n;
-            return m.PointCount > 0;
         }
-
-        private static void ReduceTo4_Spread(in Span8 pts, in Span8 depths, int count, float3 n, uint fidBase, ref ContactManifold m)
-        {
-            // 1) pick deepest as anchor
-            int i0 = 0;
-            float d0 = depths[0].x;
-            for (int i = 1; i < count; i++)
-            {
-                float d = depths[i].x;
-                if (d > d0) { d0 = d; i0 = i; }
-            }
-
-            // Build tangent basis (any stable basis)
-            BuildBasis(n, out float3 t0, out float3 t1);
-
-            // Project to 2D in contact plane
-            float2 p0 = Project2(pts[i0], t0, t1);
-
-            // 2) pick farthest from anchor
-            int i1 = i0;
-            float best = -1f;
-            for (int i = 0; i < count; i++)
-            {
-                if (i == i0) continue;
-                float2 p = Project2(pts[i], t0, t1);
-                float dsq = math.lengthsq(p - p0);
-                if (dsq > best) { best = dsq; i1 = i; }
-            }
-
-            // If everything collapsed, just output the deepest
-            if (i1 == i0)
-            {
-                AddPoint(ref m, pts[i0], depths[i0].x, fidBase);
-                return;
-            }
-
-            float2 p1 = Project2(pts[i1], t0, t1);
-
-            // 3) pick point with max distance to line (p0->p1) (maximize area)
-            int i2 = i0;
-            best = -1f;
-            for (int i = 0; i < count; i++)
-            {
-                if (i == i0 || i == i1) continue;
-                float2 p = Project2(pts[i], t0, t1);
-                float area2 = math.abs(Cross2(p1 - p0, p - p0)); // 2*area
-                if (area2 > best) { best = area2; i2 = i; }
-            }
-
-            // 4) pick point farthest from triangle (maximize coverage)
-            int i3 = i0;
-            best = -1f;
-            for (int i = 0; i < count; i++)
-            {
-                if (i == i0 || i == i1 || i == i2) continue;
-                float2 p = Project2(pts[i], t0, t1);
-                float dsq = DistSqToSegment2(p, p0, p1);
-                if (i2 != i0) dsq = math.min(dsq, DistSqToSegment2(p, p1, Project2(pts[i2], t0, t1)));
-                if (i2 != i0) dsq = math.min(dsq, DistSqToSegment2(p, Project2(pts[i2], t0, t1), p0));
-                if (dsq > best) { best = dsq; i3 = i; }
-            }
-
-            // Emit in a stable order: deepest first, then spread
-            AddPoint(ref m, pts[i0], depths[i0].x, fidBase + 0u);
-            AddPoint(ref m, pts[i1], depths[i1].x, fidBase + 1u);
-
-            if (i2 != i0)
-                AddPoint(ref m, pts[i2], depths[i2].x, fidBase + 2u);
-
-            if (i3 != i0 && i3 != i1 && i3 != i2)
-                AddPoint(ref m, pts[i3], depths[i3].x, fidBase + 3u);
-        }
-
-        private static void BuildBasis(float3 n, out float3 t0, out float3 t1)
-        {
-            // Pick a vector not parallel to n
-            float3 a = (math.abs(n.y) < 0.99f) ? new float3(0, 1, 0) : new float3(1, 0, 0);
-            t0 = math.normalizesafe(math.cross(a, n), new float3(1, 0, 0));
-            t1 = math.cross(n, t0);
-        }
-
-        private static float2 Project2(float3 p, float3 t0, float3 t1)
-        {
-            return new float2(math.dot(p, t0), math.dot(p, t1));
-        }
-
-        private static float Cross2(float2 a, float2 b) => a.x * b.y - a.y * b.x;
-
-        private static float DistSqToSegment2(float2 p, float2 a, float2 b)
-        {
-            float2 ab = b - a;
-            float denom = math.max(math.dot(ab, ab), 1e-12f);
-            float t = math.dot(p - a, ab) / denom;
-            t = math.clamp(t, 0f, 1f);
-            float2 q = a + ab * t;
-            return math.lengthsq(p - q);
-        }
-
 
         // -------------------------
-        // Types
+        // Edge-edge manifold (SAT-driven)
         // -------------------------
-        private enum AxisKind : byte { FaceA, FaceB, EdgeEdge }
-
-        private struct AxisChoice
+        private static void BuildEdgeEdge(float3 aC, in float3x3 A, float3 aE,
+                                          float3 bC, in float3x3 B, float3 bE,
+                                          int edgeAxisA, int edgeAxisB,
+                                          float3 nAtoB,
+                                          float depth,
+                                          ref ContactManifold m)
         {
-            public float MinPen;
-            public float3 AxisW;
-            public AxisKind Kind;
-            public int I;
-            public int J;
-            public float Sign;
+            // Pick the extreme edge on each box that is "most opposing" along the normal.
+            GetEdgeSegmentOnBox(aC, A, aE, edgeAxisA, -nAtoB, out float3 ea0, out float3 ea1);
+            GetEdgeSegmentOnBox(bC, B, bE, edgeAxisB, +nAtoB, out float3 eb0, out float3 eb1);
+
+            ClosestPointsSegmentSegment(ea0, ea1, eb0, eb1, out float3 ca, out float3 cb);
+            float3 cp = 0.5f * (ca + cb);
+
+            AddPoint(ref m, cp, math.max(depth, 0f), 20u);
         }
 
+        // -------------------------
+        // SAT-case helpers
+        // -------------------------
+        private static void FindIncidentFace(in float3x3 incM, float3 refN, out int axis, out float sign)
+        {
+            float bestAbs = -1f;
+            axis = 0;
+            sign = 1f;
+
+            for (int i = 0; i < 3; i++)
+            {
+                // incM[i] returns column i (axis i)
+                float d = math.dot(incM[i], refN); // [-1..1]
+                float ad = math.abs(d);
+                if (ad > bestAbs)
+                {
+                    bestAbs = ad;
+                    axis = i;
+                    // Want incident face normal pointing opposite refN:
+                    sign = (d > 0f) ? -1f : +1f;
+                }
+            }
+        }
+
+        private static void GetFaceQuad(float3 c, in float3x3 M, float3 e, int faceAxis, float faceSign,
+                                        out float3 v0, out float3 v1, out float3 v2, out float3 v3)
+        {
+            float3 n = M[faceAxis] * faceSign;
+            float3 fc = c + n * e[faceAxis];
+
+            int t0i = (faceAxis + 1) % 3;
+            int t1i = (faceAxis + 2) % 3;
+
+            float3 t0 = M[t0i];
+            float3 t1 = M[t1i];
+
+            float ext0 = e[t0i];
+            float ext1 = e[t1i];
+
+            v0 = fc + t0 * ext0 + t1 * ext1;
+            v1 = fc - t0 * ext0 + t1 * ext1;
+            v2 = fc - t0 * ext0 - t1 * ext1;
+            v3 = fc + t0 * ext0 - t1 * ext1;
+        }
+
+        // -------------------------
+        // Clipping
+        // -------------------------
         private struct Plane4
         {
             public float3 N;
             public float D; // dot(N, X) + D = 0
         }
+
+        private static Plane4 PlaneFromPointNormal(float3 p, float3 n)
+        {
+            n = math.normalizesafe(n, new float3(0, 1, 0));
+            return new Plane4 { N = n, D = -math.dot(n, p) };
+        }
+
+        private static float SignedDistance(in Plane4 pl, float3 p)
+            => math.dot(pl.N, p) + pl.D;
 
         private struct Span8
         {
@@ -376,81 +435,6 @@ namespace Shard.Manifolds
             }
         }
 
-        // -------------------------
-        // Axis selection helper
-        // -------------------------
-        private static void Consider(ref AxisChoice best, float pen, float3 axisW, AxisKind kind, int i, int j, float sign, float3 tW)
-        {
-            // keep axis pointing A->B
-            if (math.dot(axisW, tW) < 0f) axisW = -axisW;
-
-            if (pen < best.MinPen)
-            {
-                best.MinPen = pen;
-                best.AxisW = axisW;
-                best.Kind = kind;
-                best.I = i;
-                best.J = j;
-                best.Sign = sign;
-            }
-        }
-
-        // -------------------------
-        // Face helpers (incident selection + quad)
-        // -------------------------
-        private static void FindIncidentFace(in float3x3 incM, float3 refN, out int axis, out float sign)
-        {
-            float bestAbs = -1f;
-            axis = 0;
-            sign = 1f;
-
-            for (int i = 0; i < 3; i++)
-            {
-                float d = math.dot(incM[i], refN);   // [-1..1]
-                float ad = math.abs(d);
-                if (ad > bestAbs)
-                {
-                    bestAbs = ad;
-                    axis = i;
-                    // We want incident face normal pointing opposite refN:
-                    sign = (d > 0f) ? -1f : +1f;
-                }
-            }
-        }
-
-        private static void GetFaceQuad(float3 c, in float3x3 M, float3 e, int faceAxis, float faceSign,
-                                        out float3 v0, out float3 v1, out float3 v2, out float3 v3)
-        {
-            float3 n = M[faceAxis] * faceSign;
-            float3 fc = c + n * e[faceAxis];
-
-            int t0i = (faceAxis + 1) % 3;
-            int t1i = (faceAxis + 2) % 3;
-
-            float3 t0 = M[t0i];
-            float3 t1 = M[t1i];
-
-            float ext0 = e[t0i];
-            float ext1 = e[t1i];
-
-            v0 = fc + t0 * ext0 + t1 * ext1;
-            v1 = fc - t0 * ext0 + t1 * ext1;
-            v2 = fc - t0 * ext0 - t1 * ext1;
-            v3 = fc + t0 * ext0 - t1 * ext1;
-        }
-
-        // -------------------------
-        // Clipping
-        // -------------------------
-        private static Plane4 PlaneFromPointNormal(float3 p, float3 n)
-        {
-            n = math.normalizesafe(n, new float3(0, 1, 0));
-            return new Plane4 { N = n, D = -math.dot(n, p) };
-        }
-
-        private static float SignedDistance(in Plane4 pl, float3 p)
-            => math.dot(pl.N, p) + pl.D;
-
         private static Span8 ClipPoly(Span8 poly, in Plane4 pl)
         {
             if (poly.Count == 0) return poly;
@@ -474,7 +458,6 @@ namespace Shard.Manifolds
                         float3 inter = IntersectSegmentPlane(prev, cur, prevD, curD);
                         outPoly[outPoly.Count++] = inter;
                     }
-
                     outPoly[outPoly.Count++] = cur;
                 }
                 else if (prevIn)
@@ -500,8 +483,108 @@ namespace Shard.Manifolds
         }
 
         // -------------------------
-        // Edge-edge helper: pick an extreme edge
+        // Reduction (spread to 4)
         // -------------------------
+        private static void ReduceTo4_Spread(in Span8 pts, in Span8 depths, int count, float3 n, uint fidBase, ref ContactManifold m)
+        {
+            // 1) deepest
+            int i0 = 0;
+            float d0 = depths[0].x;
+            for (int i = 1; i < count; i++)
+            {
+                float d = depths[i].x;
+                if (d > d0) { d0 = d; i0 = i; }
+            }
+
+            BuildBasis(n, out float3 t0, out float3 t1);
+            float2 p0 = Project2(pts[i0], t0, t1);
+
+            // 2) farthest from deepest
+            int i1 = i0;
+            float best = -1f;
+            for (int i = 0; i < count; i++)
+            {
+                if (i == i0) continue;
+                float2 p = Project2(pts[i], t0, t1);
+                float dsq = math.lengthsq(p - p0);
+                if (dsq > best) { best = dsq; i1 = i; }
+            }
+
+            if (i1 == i0)
+            {
+                AddPoint(ref m, pts[i0], depths[i0].x, fidBase + 0u);
+                return;
+            }
+
+            float2 p1 = Project2(pts[i1], t0, t1);
+
+            // 3) max distance to line p0->p1
+            int i2 = i0;
+            best = -1f;
+            for (int i = 0; i < count; i++)
+            {
+                if (i == i0 || i == i1) continue;
+                float2 p = Project2(pts[i], t0, t1);
+                float area2 = math.abs(Cross2(p1 - p0, p - p0));
+                if (area2 > best) { best = area2; i2 = i; }
+            }
+
+            // 4) farthest from triangle edges
+            int i3 = i0;
+            best = -1f;
+            float2 p2 = (i2 != i0) ? Project2(pts[i2], t0, t1) : p0;
+
+            for (int i = 0; i < count; i++)
+            {
+                if (i == i0 || i == i1 || i == i2) continue;
+                float2 p = Project2(pts[i], t0, t1);
+                float dsq = DistSqToSegment2(p, p0, p1);
+                if (i2 != i0)
+                {
+                    dsq = math.min(dsq, DistSqToSegment2(p, p1, p2));
+                    dsq = math.min(dsq, DistSqToSegment2(p, p2, p0));
+                }
+                if (dsq > best) { best = dsq; i3 = i; }
+            }
+
+            AddPoint(ref m, pts[i0], depths[i0].x, fidBase + 0u);
+            AddPoint(ref m, pts[i1], depths[i1].x, fidBase + 1u);
+            if (i2 != i0) AddPoint(ref m, pts[i2], depths[i2].x, fidBase + 2u);
+            if (i3 != i0 && i3 != i1 && i3 != i2) AddPoint(ref m, pts[i3], depths[i3].x, fidBase + 3u);
+        }
+
+        private static void BuildBasis(float3 n, out float3 t0, out float3 t1)
+        {
+            float3 a = (math.abs(n.y) < 0.99f) ? new float3(0, 1, 0) : new float3(1, 0, 0);
+            t0 = math.normalizesafe(math.cross(a, n), new float3(1, 0, 0));
+            t1 = math.cross(n, t0);
+        }
+
+        private static float2 Project2(float3 p, float3 t0, float3 t1) => new float2(math.dot(p, t0), math.dot(p, t1));
+        private static float Cross2(float2 a, float2 b) => a.x * b.y - a.y * b.x;
+
+        private static float DistSqToSegment2(float2 p, float2 a, float2 b)
+        {
+            float2 ab = b - a;
+            float denom = math.max(math.dot(ab, ab), 1e-12f);
+            float t = math.dot(p - a, ab) / denom;
+            t = math.clamp(t, 0f, 1f);
+            float2 q = a + ab * t;
+            return math.lengthsq(p - q);
+        }
+
+        // -------------------------
+        // Support / edge selection (edge-edge)
+        // -------------------------
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 SupportPoint(float3 c, in float3x3 M, float3 e, float3 dirW)
+        {
+            float sx = (math.dot(dirW, M.c0) >= 0f) ? 1f : -1f;
+            float sy = (math.dot(dirW, M.c1) >= 0f) ? 1f : -1f;
+            float sz = (math.dot(dirW, M.c2) >= 0f) ? 1f : -1f;
+            return c + M.c0 * (sx * e.x) + M.c1 * (sy * e.y) + M.c2 * (sz * e.z);
+        }
+
         private static void GetEdgeSegmentOnBox(float3 c, in float3x3 M, float3 e, int edgeAxis, float3 towardNormal,
                                                 out float3 p0, out float3 p1)
         {
@@ -517,16 +600,6 @@ namespace Shard.Manifolds
 
             p0 = baseP - dir * e[a0];
             p1 = baseP + dir * e[a0];
-        }
-
-        // -------------------------
-        // Geometry helpers
-        // -------------------------
-        private static void GetBoxWorld(in BoxCollider b, in Pose pose, out float3 c, out quaternion r, out float3 he)
-        {
-            c = pose.Position + math.mul(pose.Rotation, b.Center);
-            r = math.mul(pose.Rotation, b.Orientation);
-            he = b.HalfExtents;
         }
 
         private static void ClosestPointsSegmentSegment(float3 p1, float3 q1, float3 p2, float3 q2, out float3 c1, out float3 c2)
@@ -592,7 +665,17 @@ namespace Shard.Manifolds
         }
 
         // -------------------------
-        // Manifold helpers (mirrors your Narrowphase ones)
+        // Geometry helpers
+        // -------------------------
+        private static void GetBoxWorld(in BoxCollider b, in Pose pose, out float3 c, out quaternion r, out float3 he)
+        {
+            c = pose.Position + math.mul(pose.Rotation, b.Center);
+            r = math.mul(pose.Rotation, b.Orientation);
+            he = b.HalfExtents;
+        }
+
+        // -------------------------
+        // Manifold helpers
         // -------------------------
         private static void ClearManifold(ref ContactManifold m)
         {
@@ -629,6 +712,4 @@ namespace Shard.Manifolds
             else m.P3 = cp;
         }
     }
-    
-
 }
