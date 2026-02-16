@@ -1,0 +1,17 @@
+{
+    "name": "BepuTests",
+    "rootNamespace": "BepuTests",
+    "references": [
+        "GUID:a3f9c85992560a446ae5386faa52ed08",
+        "GUID:073be64ef0c32484a93abe79063e0eca"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
