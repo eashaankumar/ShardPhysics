@@ -1,4 +1,5 @@
 using Shard.Manifolds;
+using System;
 using System.Runtime.CompilerServices;
 using Unity.Burst;
 using Unity.Collections;
@@ -7,7 +8,7 @@ using Unity.Mathematics;
 
 namespace Shard
 {
-    public sealed class PhysicsWorld : System.IDisposable
+    public sealed class PhysicsWorld : IDisposable
     {
         public readonly Allocator Allocator;
         public int BodyCount => m_bodyCount;
@@ -24,7 +25,12 @@ namespace Shard
         internal NativeList<Damping> Dampings;
         internal NativeList<byte> BodyAlive; // 0 = free, 1 = alive
 
-        private NativeParallelHashMap<ulong, float> _warmN; // key=(a<<32)|(b&0xFFFFFFFF) ^ fid
+        // Sleeping
+        internal NativeList<float> SleepTime;   // seconds under thresholds
+        internal NativeList<byte> IsSleeping;   // 0/1
+
+        // Warm-start (normal impulses by feature id)
+        private NativeParallelHashMap<ulong, float> _warmN; // key=(min<<32)^max^(fid<<1)
 
         // Bookkeeping
         internal NativeList<int> FreeBodySlots; // free-list for BodyId reuse
@@ -54,14 +60,16 @@ namespace Shard
             Dampings = new NativeList<Damping>(bodyCapacity, allocator);
             FreeBodySlots = new NativeList<int>(allocator);
 
+            BodyAlive = new NativeList<byte>(bodyCapacity, allocator);
+            SleepTime = new NativeList<float>(bodyCapacity, allocator);
+            IsSleeping = new NativeList<byte>(bodyCapacity, allocator);
+
             Colliders = new ColliderStore(colliderCapacity, allocator);
 
             Broadphase = new Broadphase(allocator);
             Narrowphase = new Narrowphase(allocator);
             Constraints = new ConstraintGraph(allocator);
             Solver = new Solver(allocator);
-
-            BodyAlive = new NativeList<byte>(bodyCapacity, allocator);
 
             _warmN = new NativeParallelHashMap<ulong, float>(1024, allocator);
 
@@ -80,6 +88,8 @@ namespace Shard
 
             Scratch.Dispose();
 
+            if (_warmN.IsCreated) _warmN.Dispose();
+
             FreeBodySlots.Dispose();
             Dampings.Dispose();
             Masses.Dispose();
@@ -88,8 +98,8 @@ namespace Shard
             Bodies.Dispose();
 
             BodyAlive.Dispose();
-
-            if (_warmN.IsCreated) _warmN.Dispose();
+            SleepTime.Dispose();
+            IsSleeping.Dispose();
         }
 
         // -------------------------
@@ -104,6 +114,10 @@ namespace Shard
                 index = FreeBodySlots[^1];
                 FreeBodySlots.RemoveAtSwapBack(FreeBodySlots.Length - 1);
                 BodyAlive[index] = 1;
+
+                // reset sleeping state
+                IsSleeping[index] = 0;
+                SleepTime[index] = 0f;
             }
             else
             {
@@ -115,6 +129,9 @@ namespace Shard
                 Masses.Add(default);
                 Dampings.Add(default);
                 BodyAlive.Add(1);
+
+                IsSleeping.Add(0);
+                SleepTime.Add(0f);
 
                 m_bodyCount++;
             }
@@ -148,6 +165,10 @@ namespace Shard
             Masses[id.Value] = mass;
             Dampings[id.Value] = damping;
 
+            // New dynamic bodies start awake
+            IsSleeping[id.Value] = 0;
+            SleepTime[id.Value] = 0f;
+
             // Placeholder: keep BodyToProxy in sync (real tree comes in step 4)
             SyncProxyForBody(id);
 
@@ -171,6 +192,9 @@ namespace Shard
             Masses[id.Value] = default;
             Dampings[id.Value] = default;
 
+            IsSleeping[id.Value] = 0;
+            SleepTime[id.Value] = 0f;
+
             FreeBodySlots.Add(id.Value);
         }
 
@@ -178,6 +202,8 @@ namespace Shard
         {
             Poses[id.Value] = pose;
             SyncProxyForBody(id);
+
+            WakeBody(id.Value);
         }
 
         public void SetCollider(BodyId id, ColliderHandle collider)
@@ -187,6 +213,8 @@ namespace Shard
             Bodies[id.Value] = b;
 
             SyncProxyForBody(id);
+
+            WakeBody(id.Value);
         }
 
         // -------------------------
@@ -236,6 +264,7 @@ namespace Shard
                 Dt = dt,
                 Gravity = gravity,
                 BodyAlive = BodyAlive.AsArray(),
+                IsSleeping = IsSleeping.AsArray(),
                 Bodies = Bodies.AsArray(),
                 Velocities = Velocities.AsArray(),
                 Masses = Masses.AsArray(),
@@ -244,16 +273,20 @@ namespace Shard
 
             JobHandle hV = Unity.Jobs.IJobForExtensions.ScheduleParallel(integrateV, Bodies.Length, 64, deps);
 
-            // 2) COLLISION SOLVE (minimal): do it on main thread after hV completes
-            //    (keeping it simple + greedy as you requested)
+            // 2) Collision solve (main thread, greedy as requested)
             hV.Complete();
+
             SolveGreedy_BoxBoxOnly(dt, solverIterations: 8);
 
-            // 3) Integrate poses (job, but scheduled after solve)
+            // 2.5) Sleeping update (after solve)
+            UpdateSleeping(dt);
+
+            // 3) Integrate poses (job, scheduled after solve)
             var integrateP = new IntegratePosesJob
             {
                 Dt = dt,
                 BodyAlive = BodyAlive.AsArray(),
+                IsSleeping = IsSleeping.AsArray(),
                 Bodies = Bodies.AsArray(),
                 Poses = Poses.AsArray(),
                 Velocities = Velocities.AsArray(),
@@ -277,25 +310,36 @@ namespace Shard
             return h2;
         }
 
-        // Replace your SolveGreedy_BoxBoxOnly with this version:
+        // -------------------------
+        // Greedy solver: Box-Box only
+        // -------------------------
         private void SolveGreedy_BoxBoxOnly(float dt, int solverIterations)
         {
+            // Critical stability rules implemented here:
+            // - Warm start by feature id (accumulated normal impulse)
+            // - Restitution only on first iteration + only above threshold
+            // - Penetration bias gated to "approaching" contacts (prevents energy injection at rest)
+            // - Position projection ONLY on the last iteration (split-impulse-ish)
+            // - Sleeping handled outside
+
             const float slop = 0.001f;
             const float baumgarte = 0.10f;
             const float maxBias = 2.0f;
             const float bounceThreshold = 1.0f;
 
-            // DEBUG MODE: disable warm-start until normals are correct
-            if (_warmN.IsCreated) _warmN.Clear();
-
             for (int it = 0; it < solverIterations; it++)
             {
+                bool doProject = (it == solverIterations - 1);
+
                 for (int ia = 0; ia < Bodies.Length; ia++)
                 {
                     if (BodyAlive[ia] == 0) continue;
 
                     var bodyA = Bodies[ia];
                     if (!Colliders.IsValid(bodyA.Collider)) continue;
+
+                    // Skip sleeping bodies for collision response (they can still be woken if impacted)
+                    bool sleepA = (IsSleeping[ia] != 0);
 
                     ref var ha = ref Colliders.Resolve(bodyA.Collider);
                     if (ha.Type != ColliderType.Box) continue;
@@ -313,11 +357,16 @@ namespace Shard
                         var bodyB = Bodies[ib];
                         if (!Colliders.IsValid(bodyB.Collider)) continue;
 
+                        bool sleepB = (IsSleeping[ib] != 0);
+
                         ref var hb = ref Colliders.Resolve(bodyB.Collider);
                         if (hb.Type != ColliderType.Box) continue;
 
                         if (bodyA.MotionType == MotionType.Static && bodyB.MotionType == MotionType.Static)
                             continue;
+
+                        // If both sleeping, ignore (no need to solve)
+                        if (sleepA && sleepB) continue;
 
                         bool dynB = bodyB.MotionType == MotionType.Dynamic;
                         var massB = Masses[ib];
@@ -332,20 +381,11 @@ namespace Shard
                         Pose poseB = Poses[ib];
 
                         ContactManifold m = default;
-                        if (!Shard.Manifolds.BoxBoxManifold.Generate(in boxA, in poseA, in boxB, in poseB, ref m))
+                        if (!BoxBoxManifold.Generate(in boxA, in poseA, in boxB, in poseB, ref m))
                             continue;
 
-                        // Position projection first (prevents deep overlap)
-                        PositionProject(ia, ib, in m);
-
-                        poseA = Poses[ia];
-                        poseB = Poses[ib];
-
-                        m = default;
-                        if (!Shard.Manifolds.BoxBoxManifold.Generate(in boxA, in poseA, in boxB, in poseB, ref m))
+                        if (m.PointCount <= 0)
                             continue;
-
-                        if (m.PointCount <= 0) continue;
 
                         // Force normal consistency every time (A -> B)
                         float3 n = FixNormalAtoB(m.Normal, poseA.Position, poseB.Position);
@@ -359,6 +399,7 @@ namespace Shard
                         var velA = Velocities[ia];
                         var velB = Velocities[ib];
 
+                        // Solve each point
                         for (int pi = 0; pi < m.PointCount; pi++)
                         {
                             ref ContactPoint cp = ref GetPointRef(ref m, pi);
@@ -375,17 +416,46 @@ namespace Shard
 
                             float vn = math.dot(vRel, n);
 
-                            // Restitution only on first iteration to avoid re-injecting energy
+                            // ---- Warm start (normal only) ----
+                            ulong key = MakeContactKey(ia, ib, cp.FeatureId);
+                            float cachedN = 0f;
+                            if (_warmN.TryGetValue(key, out cachedN) && cachedN > 0f)
+                            {
+                                float3 Pw = n * cachedN;
+
+                                if (dynA)
+                                {
+                                    velA.Linear -= Pw * invMassA;
+                                    velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pw));
+                                }
+                                if (dynB)
+                                {
+                                    velB.Linear += Pw * invMassB;
+                                    velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pw));
+                                }
+
+                                // recompute after warm start for better stability
+                                vAatP = velA.Linear + math.cross(velA.Angular, rA);
+                                vBatP = velB.Linear + math.cross(velB.Angular, rB);
+                                vRel = vBatP - vAatP;
+                                vn = math.dot(vRel, n);
+                            }
+
+                            // Restitution only on first iteration and only for real impacts
                             float bounce = 0f;
                             if (it == 0 && vn < -bounceThreshold)
                                 bounce = -e * vn;
 
-                            // Bias for penetration (velocity-level)
+                            // Bias (velocity-level) – ONLY when approaching
+                            float bias = 0f;
                             float depth = pen - slop;
-                            float bias = (depth > 0f) ? (baumgarte / dt) * depth : 0f;
-                            bias = math.min(bias, maxBias);
+                            if (depth > 0f && vn < -0.2f)
+                            {
+                                bias = (baumgarte / dt) * depth;
+                                bias = math.min(bias, maxBias);
+                            }
 
-                            // --- Normal effective mass ---
+                            // ---- Normal effective mass ----
                             float3 rnA = math.cross(rA, n);
                             float3 rnB = math.cross(rB, n);
 
@@ -399,25 +469,38 @@ namespace Shard
 
                             if (kN < 1e-8f) continue;
 
-                            // --- Normal impulse ---
+                            // Sequential impulse (accumulate)
                             float lambdaN = -(vn - bounce - bias) / kN;
-                            if (lambdaN < 0f) lambdaN = 0f;
 
-                            float3 Pn = n * lambdaN;
+                            float oldN = cachedN;
+                            float newN = math.max(0f, oldN + lambdaN);
+                            float dN = newN - oldN;
 
-                            if (dynA)
+                            if (dN != 0f)
                             {
-                                velA.Linear -= Pn * invMassA;
-                                velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pn));
-                            }
-                            if (dynB)
-                            {
-                                velB.Linear += Pn * invMassB;
-                                velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pn));
+                                float3 Pn = n * dN;
+
+                                if (dynA)
+                                {
+                                    velA.Linear -= Pn * invMassA;
+                                    velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pn));
+                                }
+                                if (dynB)
+                                {
+                                    velB.Linear += Pn * invMassB;
+                                    velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pn));
+                                }
+
+                                // store accumulator
+                                _warmN[key] = newN;
+
+                                // wake if we actually applied impulse
+                                if (dynA) WakeBody(ia);
+                                if (dynB) WakeBody(ib);
                             }
 
-                            // --- Friction impulse (Coulomb) ---
-                            // Recompute relative velocity after normal impulse
+                            // ---- Friction (Coulomb, impulse clamped by mu * normalImpulseIncrement) ----
+                            // Recompute vRel after normal
                             vAatP = velA.Linear + math.cross(velA.Angular, rA);
                             vBatP = velB.Linear + math.cross(velB.Angular, rB);
                             vRel = vBatP - vAatP;
@@ -442,23 +525,31 @@ namespace Shard
 
                                 if (kT > 1e-8f)
                                 {
+                                    // desired tangential impulse
                                     float lambdaT = -(math.dot(vRel, t)) / kT;
 
-                                    // Clamp by Coulomb friction
-                                    float maxT = mu * lambdaN;
+                                    // Clamp by Coulomb: use the *incremental* normal impulse dN for this solve step
+                                    // (prevents friction from doing weird things when normal accumulator is huge)
+                                    float maxT = mu * math.abs(dN);
                                     lambdaT = math.clamp(lambdaT, -maxT, +maxT);
 
-                                    float3 Pt = t * lambdaT;
+                                    if (lambdaT != 0f)
+                                    {
+                                        float3 Pt = t * lambdaT;
 
-                                    if (dynA)
-                                    {
-                                        velA.Linear -= Pt * invMassA;
-                                        velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pt));
-                                    }
-                                    if (dynB)
-                                    {
-                                        velB.Linear += Pt * invMassB;
-                                        velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pt));
+                                        if (dynA)
+                                        {
+                                            velA.Linear -= Pt * invMassA;
+                                            velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pt));
+                                        }
+                                        if (dynB)
+                                        {
+                                            velB.Linear += Pt * invMassB;
+                                            velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pt));
+                                        }
+
+                                        if (dynA) WakeBody(ia);
+                                        if (dynB) WakeBody(ib);
                                     }
                                 }
                             }
@@ -466,17 +557,87 @@ namespace Shard
 
                         Velocities[ia] = velA;
                         Velocities[ib] = velB;
+
+                        // Position projection ONLY once (last iteration), using the corrected normal
+                        if (doProject)
+                        {
+                            // Rebuild manifold once to get up-to-date penetration after velocity changes
+                            poseA = Poses[ia];
+                            poseB = Poses[ib];
+
+                            ContactManifold pm = default;
+                            if (BoxBoxManifold.Generate(in boxA, in poseA, in boxB, in poseB, ref pm) && pm.PointCount > 0)
+                            {
+                                float3 pn = FixNormalAtoB(pm.Normal, poseA.Position, poseB.Position);
+                                PositionProject(ia, ib, in pm, pn);
+                            }
+                        }
                     }
                 }
             }
         }
 
+        // -------------------------
+        // Sleeping
+        // -------------------------
+        private void UpdateSleeping(float dt)
+        {
+            // Tweak these to taste.
+            const float linThresh = 0.02f;          // m/s
+            const float angThresh = 0.10f;          // rad/s
+            const float linThreshSq = linThresh * linThresh;
+            const float angThreshSq = angThresh * angThresh;
+            const float timeToSleep = 0.5f;         // seconds
 
+            for (int i = 0; i < Bodies.Length; i++)
+            {
+                if (BodyAlive[i] == 0) continue;
+                if (Bodies[i].MotionType != MotionType.Dynamic) continue;
+
+                if (IsSleeping[i] != 0)
+                {
+                    // keep asleep unless something external wakes it
+                    Velocities[i] = default;
+                    continue;
+                }
+
+                var v = Velocities[i];
+
+                if (math.lengthsq(v.Linear) < linThreshSq && math.lengthsq(v.Angular) < angThreshSq)
+                {
+                    SleepTime[i] += dt;
+                    if (SleepTime[i] >= timeToSleep)
+                    {
+                        IsSleeping[i] = 1;
+                        SleepTime[i] = timeToSleep;
+                        v.Linear = 0f;
+                        v.Angular = 0f;
+                        Velocities[i] = v;
+                    }
+                }
+                else
+                {
+                    SleepTime[i] = 0f;
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WakeBody(int i)
+        {
+            if ((uint)i >= (uint)Bodies.Length) return;
+            if (Bodies[i].MotionType != MotionType.Dynamic) return;
+            IsSleeping[i] = 0;
+            SleepTime[i] = 0f;
+        }
+
+        // -------------------------
+        // Helpers
+        // -------------------------
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float3 FixNormalAtoB(float3 n, float3 posA, float3 posB)
         {
             float3 ab = posB - posA;
-            // If normal doesn't point from A to B, flip it.
             if (math.dot(n, ab) < 0f) n = -n;
             return n;
         }
@@ -493,14 +654,12 @@ namespace Shard
             }
         }
 
-        // Optional: keep PositionProject but make it tiny + call it ONLY ONCE per pair
-        // (If you still want it, use this version and call it after the solverIterations loop,
-        //  OR call it once per collision pair, NOT every iteration.)
-        private void PositionProject(int ia, int ib, in ContactManifold m)
+        // Position projection: gentle, once per pair per step (last iteration)
+        private void PositionProject(int ia, int ib, in ContactManifold m, float3 normal)
         {
             const float slop = 0.001f;   // meters
-            const float percent = 0.2f;  // gentle correction
-            const float maxCorr = 0.01f; // clamp small
+            const float percent = 0.20f; // gentle correction
+            const float maxCorr = 0.02f; // clamp
 
             var bodyA = Bodies[ia];
             var bodyB = Bodies[ib];
@@ -514,6 +673,7 @@ namespace Shard
             float invMassSum = invMassA + invMassB;
             if (invMassSum <= 0f) return;
 
+            // deepest point
             float bestPen = 0f;
             for (int pi = 0; pi < m.PointCount; pi++)
             {
@@ -531,13 +691,14 @@ namespace Shard
             if (depth <= 0f) return;
 
             float corrMag = math.min(depth * percent, maxCorr);
-            float3 corr = m.Normal * (corrMag / invMassSum);
+            float3 corr = normal * (corrMag / invMassSum);
 
             if (dynA)
             {
                 var pA = Poses[ia];
                 pA.Position -= corr * invMassA;
                 Poses[ia] = pA;
+                WakeBody(ia);
             }
 
             if (dynB)
@@ -545,6 +706,7 @@ namespace Shard
                 var pB = Poses[ib];
                 pB.Position += corr * invMassB;
                 Poses[ib] = pB;
+                WakeBody(ib);
             }
         }
 
@@ -568,6 +730,10 @@ namespace Shard
         }
     }
 
+    // -------------------------
+    // Jobs
+    // -------------------------
+
     [BurstCompile]
     internal struct IntegrateVelocitiesJob : IJobFor
     {
@@ -575,6 +741,7 @@ namespace Shard
         public float3 Gravity;
 
         [ReadOnly] public NativeArray<byte> BodyAlive;
+        [ReadOnly] public NativeArray<byte> IsSleeping;
         [ReadOnly] public NativeArray<Body> Bodies;
 
         public NativeArray<Velocity> Velocities;
@@ -587,6 +754,12 @@ namespace Shard
 
             var body = Bodies[i];
             if (body.MotionType != MotionType.Dynamic) return;
+
+            if (IsSleeping[i] != 0)
+            {
+                Velocities[i] = default;
+                return;
+            }
 
             var v = Velocities[i];
             var m = Masses[i];
@@ -610,6 +783,7 @@ namespace Shard
         public float Dt;
 
         [ReadOnly] public NativeArray<byte> BodyAlive;
+        [ReadOnly] public NativeArray<byte> IsSleeping;
         [ReadOnly] public NativeArray<Body> Bodies;
 
         public NativeArray<Pose> Poses;
@@ -621,6 +795,7 @@ namespace Shard
 
             var body = Bodies[i];
             if (body.MotionType != MotionType.Dynamic) return;
+            if (IsSleeping[i] != 0) return;
 
             var v = Velocities[i];
 
@@ -640,7 +815,6 @@ namespace Shard
         }
     }
 
-
     [BurstCompile]
     internal struct IntegrateJob : IJobFor
     {
@@ -648,6 +822,7 @@ namespace Shard
         public float3 Gravity;
 
         [ReadOnly] public NativeArray<byte> BodyAlive;
+        [ReadOnly] public NativeArray<byte> IsSleeping;
         [ReadOnly] public NativeArray<Body> Bodies;
 
         public NativeArray<Pose> Poses;
@@ -661,6 +836,11 @@ namespace Shard
 
             var body = Bodies[i];
             if (body.MotionType != MotionType.Dynamic) return;
+            if (IsSleeping[i] != 0)
+            {
+                Velocities[i] = default;
+                return;
+            }
 
             var v = Velocities[i];
             var m = Masses[i];
