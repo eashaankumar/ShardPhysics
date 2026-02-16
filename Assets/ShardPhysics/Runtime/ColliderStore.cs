@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace Shard
 {
-    internal struct ColliderHeader
+    public struct ColliderHeader
     {
         public ColliderType Type;
         public ushort Version;
@@ -15,7 +15,7 @@ namespace Shard
         public ushort MaterialId;  // collider-level material
     }
 
-    internal struct ColliderSlot
+    public struct ColliderSlot
     {
         public ColliderHeader Header;
         public int NextFree; // for free list
@@ -30,7 +30,7 @@ namespace Shard
     }
 
 
-    internal sealed class ColliderStore : IDisposable
+    public sealed class ColliderStore : IDisposable
     {
         private readonly Allocator _allocator;
 

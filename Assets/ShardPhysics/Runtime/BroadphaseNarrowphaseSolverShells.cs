@@ -3,7 +3,7 @@ using Unity.Mathematics;
 
 namespace Shard
 {
-    internal struct Broadphase : System.IDisposable
+    public struct Broadphase : System.IDisposable
     {
         public NativeList<int> BodyToProxy;
         public NativeList<Aabb> ProxyAabbs;
@@ -50,7 +50,7 @@ namespace Shard
         }
     }
 
-    internal struct Narrowphase : System.IDisposable
+    public struct Narrowphase : System.IDisposable
     {
         // Pair cache + manifolds
         public NativeList<ContactManifold> Manifolds;
