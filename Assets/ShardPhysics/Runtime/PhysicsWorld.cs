@@ -350,7 +350,14 @@ namespace Shard
 
                             float bias = 0f;
                             float depth = pen - slop;
-                            if (depth > 0f) bias = (beta / dt) * depth;
+                            if (depth > 0f)
+                            {
+                                bias = (beta / dt) * depth;
+
+                                // clamp (prevents catapulting)
+                                const float maxBias = 2;
+                                bias = math.min(bias, maxBias);
+                            }
 
                             float3 rnA = math.cross(rA, n);
                             float3 rnB = math.cross(rB, n);
@@ -365,7 +372,7 @@ namespace Shard
 
                             if (k < 1e-8f) continue;
 
-                            float lambda = -(vn + bias) / k;
+                            float lambda = -(vn - bias) / k;
                             if (lambda < 0f) lambda = 0f;
 
                             float3 P = n * lambda;
@@ -383,10 +390,67 @@ namespace Shard
                             }
                         }
 
+                        PositionProject(ia, ib, in m);
+
                         Velocities[ia] = velA;
                         Velocities[ib] = velB;
                     }
                 }
+            }
+        }
+
+        private void PositionProject(int ia, int ib, in ContactManifold m)
+        {
+            const float slop = 0.001f;      // meters
+            const float percent = 0.8f;     // 80% correction per call
+            const float maxCorr = 0.05f;    // meters, clamp so we don't teleport
+
+            var bodyA = Bodies[ia];
+            var bodyB = Bodies[ib];
+
+            bool dynA = bodyA.MotionType == MotionType.Dynamic;
+            bool dynB = bodyB.MotionType == MotionType.Dynamic;
+
+            // Kinematic + Static treated as infinite mass (no position move)
+            float invMassA = dynA ? Masses[ia].InverseMass : 0f;
+            float invMassB = dynB ? Masses[ib].InverseMass : 0f;
+
+            float invMassSum = invMassA + invMassB;
+            if (invMassSum <= 0f) return;
+
+            // Use deepest point for correction (stable & minimal)
+            float bestPen = 0f;
+            for (int pi = 0; pi < m.PointCount; pi++)
+            {
+                float pen = pi switch
+                {
+                    0 => m.P0.Penetration,
+                    1 => m.P1.Penetration,
+                    2 => m.P2.Penetration,
+                    _ => m.P3.Penetration
+                };
+                if (pen > bestPen) bestPen = pen;
+            }
+
+            float depth = bestPen - slop;
+            if (depth <= 0f) return;
+
+            float corrMag = math.min(depth * percent, maxCorr);
+            float3 corr = m.Normal * (corrMag / invMassSum);
+
+            // Move A opposite normal, B along normal
+            if (dynA)
+            {
+                var pA = Poses[ia];
+                pA.Position -= corr * invMassA;
+                Poses[ia] = pA;
+            }
+
+            if (dynB)
+            {
+                var pB = Poses[ib];
+                pB.Position += corr * invMassB;
+                Poses[ib] = pB;
             }
         }
 

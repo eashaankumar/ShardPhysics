@@ -52,7 +52,7 @@ namespace Shard.Tests
 
             // Body B (slightly rotated, near A)
             bId = world.AddBody(
-                motionType: MotionType.Dynamic,
+                motionType: MotionType.Kinematic,
                 pose: new Pose
                 {
                     Position = boxBTransform.position,
