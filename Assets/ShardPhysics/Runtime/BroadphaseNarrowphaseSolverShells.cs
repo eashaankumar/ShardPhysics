@@ -1,4 +1,4 @@
-using Shard.Manifolds.Shard;
+using Shard.Manifolds;
 using Unity.Collections;
 using Unity.Mathematics;
 
@@ -1378,7 +1378,7 @@ namespace Shard
             if (m.P2.Penetration < minPen) { minPen = m.P2.Penetration; idx = 2; }
             if (m.P3.Penetration < minPen) { minPen = m.P3.Penetration; idx = 3; }
 
-            if (pen <= minPen) return;
+            if (pen < minPen) return;
 
             if (idx == 0) m.P0 = cp;
             else if (idx == 1) m.P1 = cp;
