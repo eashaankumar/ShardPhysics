@@ -1,3 +1,5 @@
+using Shard.Manifolds;
+using System.Runtime.CompilerServices;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Jobs;
@@ -16,7 +18,7 @@ namespace Shard
 
         // ---- Bodies (SoA) ----
         internal NativeList<Body> Bodies;
-        internal NativeList<Pose> Poses;
+        public NativeList<Pose> Poses;
         internal NativeList<Velocity> Velocities;
         internal NativeList<MassProperties> Masses;
         internal NativeList<Damping> Dampings;
@@ -27,7 +29,7 @@ namespace Shard
         internal int m_bodyCount;
 
         // ---- Colliders ----
-        internal ColliderStore Colliders;
+        public ColliderStore Colliders;
 
         // ---- Broadphase / Narrowphase / Solver ----
         internal Broadphase Broadphase;
@@ -220,24 +222,40 @@ namespace Shard
 
         public JobHandle Step(float dt, float3 gravity, JobHandle deps = default)
         {
-            // Ensure proxy buffers can hold all bodies (proxyId == body index for now)
             Broadphase.EnsureBodyCapacity(Bodies.Length);
 
-            var integrate = new IntegrateJob
+            // 1) Integrate velocities (job)
+            var integrateV = new IntegrateVelocitiesJob
             {
                 Dt = dt,
                 Gravity = gravity,
                 BodyAlive = BodyAlive.AsArray(),
                 Bodies = Bodies.AsArray(),
-                Poses = Poses.AsArray(),
                 Velocities = Velocities.AsArray(),
                 Masses = Masses.AsArray(),
                 Dampings = Dampings.AsArray()
             };
 
-            // Batch size: tune later
-            JobHandle h1 = integrate.ScheduleParallel(Bodies.Length, 64, deps);
+            JobHandle hV = Unity.Jobs.IJobForExtensions.ScheduleParallel(integrateV, Bodies.Length, 64, deps);
 
+            // 2) COLLISION SOLVE (minimal): do it on main thread after hV completes
+            //    (keeping it simple + greedy as you requested)
+            hV.Complete();
+            SolveGreedy_BoxBoxOnly(dt, solverIterations: 8);
+
+            // 3) Integrate poses (job, but scheduled after solve)
+            var integrateP = new IntegratePosesJob
+            {
+                Dt = dt,
+                BodyAlive = BodyAlive.AsArray(),
+                Bodies = Bodies.AsArray(),
+                Poses = Poses.AsArray(),
+                Velocities = Velocities.AsArray(),
+            };
+
+            JobHandle hP = Unity.Jobs.IJobForExtensions.ScheduleParallel(integrateP, Bodies.Length, 64, default);
+
+            // 4) Update proxies
             var update = new UpdateProxiesJob
             {
                 BodyAlive = BodyAlive.AsArray(),
@@ -249,8 +267,210 @@ namespace Shard
                 ProxyAabbs = Broadphase.ProxyAabbs.AsArray()
             };
 
-            JobHandle h2 = update.ScheduleParallel(Bodies.Length, 64, h1);
+            JobHandle h2 = update.ScheduleParallel(Bodies.Length, 64, hP);
             return h2;
+        }
+
+        private void SolveGreedy_BoxBoxOnly(float dt, int solverIterations)
+        {
+            const float slop = 0.001f;
+            const float beta = 0.2f;
+
+            for (int it = 0; it < solverIterations; it++)
+            {
+                for (int ia = 0; ia < Bodies.Length; ia++)
+                {
+                    if (BodyAlive[ia] == 0) continue;
+
+                    var bodyA = Bodies[ia];
+                    if (bodyA.MotionType == MotionType.Static) { /* still collide */ }
+                    if (!Colliders.IsValid(bodyA.Collider)) continue;
+
+                    ref var ha = ref Colliders.Resolve(bodyA.Collider);
+                    if (ha.Type != ColliderType.Box) continue;
+
+                    BoxCollider boxA = Colliders.Boxes[ha.PayloadIndex];
+                    Pose poseA = Poses[ia];
+
+                    for (int ib = ia + 1; ib < Bodies.Length; ib++)
+                    {
+                        if (BodyAlive[ib] == 0) continue;
+
+                        var bodyB = Bodies[ib];
+                        if (!Colliders.IsValid(bodyB.Collider)) continue;
+
+                        ref var hb = ref Colliders.Resolve(bodyB.Collider);
+                        if (hb.Type != ColliderType.Box) continue;
+
+                        if (bodyA.MotionType == MotionType.Static && bodyB.MotionType == MotionType.Static)
+                            continue;
+
+                        BoxCollider boxB = Colliders.Boxes[hb.PayloadIndex];
+                        Pose poseB = Poses[ib];
+
+                        ContactManifold m = default;
+                        if (!Shard.Manifolds.BoxBoxManifold.Generate(in boxA, in poseA, in boxB, in poseB, ref m))
+                            continue;
+
+                        float3 n = m.Normal;
+
+                        bool dynA = bodyA.MotionType == MotionType.Dynamic;
+                        bool dynB = bodyB.MotionType == MotionType.Dynamic;
+
+                        var velA = Velocities[ia];
+                        var velB = Velocities[ib];
+
+                        var massA = Masses[ia];
+                        var massB = Masses[ib];
+
+                        float invMassA = dynA ? massA.InverseMass : 0f;
+                        float invMassB = dynB ? massB.InverseMass : 0f;
+
+                        for (int pi = 0; pi < m.PointCount; pi++)
+                        {
+                            ContactPoint cp = pi switch
+                            {
+                                0 => m.P0,
+                                1 => m.P1,
+                                2 => m.P2,
+                                _ => m.P3
+                            };
+
+                            float3 p = cp.Position;
+                            float pen = cp.Penetration;
+
+                            float3 rA = p - poseA.Position;
+                            float3 rB = p - poseB.Position;
+
+                            float3 vAatP = velA.Linear + math.cross(velA.Angular, rA);
+                            float3 vBatP = velB.Linear + math.cross(velB.Angular, rB);
+                            float3 vRel = vBatP - vAatP;
+
+                            float vn = math.dot(vRel, n);
+
+                            float bias = 0f;
+                            float depth = pen - slop;
+                            if (depth > 0f) bias = (beta / dt) * depth;
+
+                            float3 rnA = math.cross(rA, n);
+                            float3 rnB = math.cross(rB, n);
+
+                            float3 iA_rnA = dynA ? MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, rnA) : float3.zero;
+                            float3 iB_rnB = dynB ? MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, rnB) : float3.zero;
+
+                            float k =
+                                invMassA + invMassB +
+                                math.dot(math.cross(iA_rnA, rA), n) +
+                                math.dot(math.cross(iB_rnB, rB), n);
+
+                            if (k < 1e-8f) continue;
+
+                            float lambda = -(vn + bias) / k;
+                            if (lambda < 0f) lambda = 0f;
+
+                            float3 P = n * lambda;
+
+                            if (dynA)
+                            {
+                                velA.Linear -= P * invMassA;
+                                velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, P));
+                            }
+
+                            if (dynB)
+                            {
+                                velB.Linear += P * invMassB;
+                                velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, P));
+                            }
+                        }
+
+                        Velocities[ia] = velA;
+                        Velocities[ib] = velB;
+                    }
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 MulInvInertiaWorld(float3 invInertiaLocal, quaternion q, float3 v)
+        {
+            // World -> local
+            float3 vLocal = math.rotate(math.conjugate(q), v);
+            // diagonal inv inertia in local space
+            float3 wLocal = vLocal * invInertiaLocal;
+            // Local -> world
+            return math.rotate(q, wLocal);
+        }
+    }
+
+    [BurstCompile]
+    internal struct IntegrateVelocitiesJob : IJobFor
+    {
+        public float Dt;
+        public float3 Gravity;
+
+        [ReadOnly] public NativeArray<byte> BodyAlive;
+        [ReadOnly] public NativeArray<Body> Bodies;
+
+        public NativeArray<Velocity> Velocities;
+        [ReadOnly] public NativeArray<MassProperties> Masses;
+        [ReadOnly] public NativeArray<Damping> Dampings;
+
+        public void Execute(int i)
+        {
+            if (BodyAlive[i] == 0) return;
+
+            var body = Bodies[i];
+            if (body.MotionType != MotionType.Dynamic) return;
+
+            var v = Velocities[i];
+            var m = Masses[i];
+            var d = Dampings[i];
+
+            if (m.InverseMass > 0f)
+                v.Linear += Gravity * Dt;
+
+            float linDamp = math.max(0f, 1f - d.Linear * Dt);
+            float angDamp = math.max(0f, 1f - d.Angular * Dt);
+            v.Linear *= linDamp;
+            v.Angular *= angDamp;
+
+            Velocities[i] = v;
+        }
+    }
+
+    [BurstCompile]
+    internal struct IntegratePosesJob : IJobFor
+    {
+        public float Dt;
+
+        [ReadOnly] public NativeArray<byte> BodyAlive;
+        [ReadOnly] public NativeArray<Body> Bodies;
+
+        public NativeArray<Pose> Poses;
+        [ReadOnly] public NativeArray<Velocity> Velocities;
+
+        public void Execute(int i)
+        {
+            if (BodyAlive[i] == 0) return;
+
+            var body = Bodies[i];
+            if (body.MotionType != MotionType.Dynamic) return;
+
+            var v = Velocities[i];
+
+            var p = Poses[i];
+            p.Position += v.Linear * Dt;
+
+            float3 w = v.Angular;
+            float wLen = math.length(w);
+            if (wLen > 0f)
+            {
+                float3 axis = w / wLen;
+                quaternion dq = quaternion.AxisAngle(axis, wLen * Dt);
+                p.Rotation = math.normalize(math.mul(p.Rotation, dq)); // quat*quat OK
+            }
+
+            Poses[i] = p;
         }
     }
 
