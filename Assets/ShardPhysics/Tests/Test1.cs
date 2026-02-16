@@ -24,13 +24,16 @@ namespace Shard.Tests
                 worldId: 1
             );
 
+            ushort rubber = world.Colliders.CreateMaterial(new PhysicsMaterial { Restitution = 0.0f, Friction = 0.9f });
+
             // Create a box collider in the ColliderStore
             // (Half extents, local center, local orientation)
             float3 he = new float3(0.5f, 0.5f, 0.5f);
             ColliderHandle boxCol = world.Colliders.CreateBox(
                 halfExtents: he,
                 center: float3.zero,
-                orientation: quaternion.identity
+                orientation: quaternion.identity,
+                materialId:rubber
             );
 
             // Mass props for this box at density=1 (or choose your mass directly)

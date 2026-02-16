@@ -326,6 +326,13 @@ namespace Shard
                         float invMassA = dynA ? massA.InverseMass : 0f;
                         float invMassB = dynB ? massB.InverseMass : 0f;
 
+                        // --- restitution (collider materials) ---
+                        PhysicsMaterial matA = Colliders.Materials[ha.MaterialId];
+                        PhysicsMaterial matB = Colliders.Materials[hb.MaterialId];
+
+                        // Combine rule: max is bounciest; min is dullest (more stable).
+                        float e = math.max(matA.Restitution, matB.Restitution);
+
                         for (int pi = 0; pi < m.PointCount; pi++)
                         {
                             ContactPoint cp = pi switch
@@ -372,7 +379,11 @@ namespace Shard
 
                             if (k < 1e-8f) continue;
 
-                            float lambda = -(vn - bias) / k;
+                            float bounce = 0f;
+                            if (vn < -0.5f) // threshold to avoid jitter-bounce at rest
+                                bounce = -e * vn;
+
+                            float lambda = -(vn - bounce - bias) / k;
                             if (lambda < 0f) lambda = 0f;
 
                             float3 P = n * lambda;

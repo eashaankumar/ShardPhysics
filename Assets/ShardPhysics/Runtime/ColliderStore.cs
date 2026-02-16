@@ -47,6 +47,7 @@ namespace Shard
         public NativeList<MeshColliderData> Meshes;
         public NativeList<CompoundCollider> Compounds;
         public NativeList<VoxelColliderData> Voxels;
+        public NativeList<PhysicsMaterial> Materials;
 
         // Convex later
         // public NativeList<ConvexColliderData> Convexes;
@@ -67,6 +68,9 @@ namespace Shard
             Meshes = new NativeList<MeshColliderData>(allocator);
             Compounds = new NativeList<CompoundCollider>(allocator);
             Voxels = new NativeList<VoxelColliderData>(allocator);
+
+            Materials = new NativeList<PhysicsMaterial>(16, allocator);
+            Materials.Add(new PhysicsMaterial { Friction = 0.6f, Restitution = 0.0f, RollingFriction = 0f }); // material 0 default
         }
 
         public void Dispose()
@@ -103,6 +107,8 @@ namespace Shard
 
             FreeSlots.Dispose();
             Slots.Dispose();
+
+            Materials.Dispose();
         }
 
         // -------------------------
@@ -167,6 +173,12 @@ namespace Shard
         {
             if (!IsValid(handle)) return;
             FreeSlot(handle.Slot);
+        }
+
+        public ushort CreateMaterial(PhysicsMaterial m)
+        {
+            Materials.Add(m);
+            return (ushort)(Materials.Length - 1);
         }
 
         // -------------------------
