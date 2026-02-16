@@ -1,3 +1,4 @@
+using Shard.Manifolds.Shard;
 using Unity.Collections;
 using Unity.Mathematics;
 
@@ -278,77 +279,10 @@ namespace Shard
         }
 
         public static bool BoxBox(in BoxCollider a, in Pose aPose,
-                                  in BoxCollider b, in Pose bPose,
-                                  ref ContactManifold m)
+                          in BoxCollider b, in Pose bPose,
+                          ref ContactManifold m)
         {
-            // OBB-OBB SAT => one stable contact point + min penetration axis
-            ClearManifold(ref m);
-
-            GetBoxWorld(a, aPose, out float3 aC, out quaternion aR, out float3 aE);
-            GetBoxWorld(b, bPose, out float3 bC, out quaternion bR, out float3 bE);
-
-            float3x3 A = new float3x3(aR);
-            float3x3 B = new float3x3(bR);
-
-            float3 t = bC - aC;
-            float3 tA = new float3(math.dot(t, A.c0), math.dot(t, A.c1), math.dot(t, A.c2));
-            float3 tB = new float3(math.dot(t, B.c0), math.dot(t, B.c1), math.dot(t, B.c2));
-
-            float3x3 R = new float3x3(
-                math.dot(A.c0, B.c0), math.dot(A.c0, B.c1), math.dot(A.c0, B.c2),
-                math.dot(A.c1, B.c0), math.dot(A.c1, B.c1), math.dot(A.c1, B.c2),
-                math.dot(A.c2, B.c0), math.dot(A.c2, B.c1), math.dot(A.c2, B.c2)
-            );
-
-            float3x3 AbsR = new float3x3(
-                math.abs(R.c0) + 1e-6f,
-                math.abs(R.c1) + 1e-6f,
-                math.abs(R.c2) + 1e-6f
-            );
-
-            float minPen = float.PositiveInfinity;
-            float3 bestAxisW = new float3(0, 1, 0);
-
-            // A axes
-            for (int i = 0; i < 3; i++)
-            {
-                float ra = aE[i];
-                float rb = bE.x * AbsR[i][0] + bE.y * AbsR[i][1] + bE.z * AbsR[i][2];
-                float dist = math.abs(tA[i]);
-                float pen = (ra + rb) - dist;
-                if (pen < 0) return false;
-                if (pen < minPen)
-                {
-                    minPen = pen;
-                    float sign = (tA[i] < 0) ? -1f : 1f;
-                    bestAxisW = A[i] * sign;
-                }
-            }
-
-            // B axes
-            for (int i = 0; i < 3; i++)
-            {
-                float ra = aE.x * AbsR[0][i] + aE.y * AbsR[1][i] + aE.z * AbsR[2][i];
-                float rb = bE[i];
-                float dist = math.abs(tB[i]);
-                float pen = (ra + rb) - dist;
-                if (pen < 0) return false;
-                if (pen < minPen)
-                {
-                    minPen = pen;
-                    float sign = (tB[i] < 0) ? -1f : 1f;
-                    bestAxisW = B[i] * sign;
-                }
-            }
-
-            float3 n = math.normalizesafe(bestAxisW, new float3(0, 1, 0));
-
-            // one stable contact near mid-plane
-            float3 p = 0.5f * (aC + bC) - n * (0.5f * minPen);
-
-            m.Normal = n;
-            AddPoint(ref m, p, minPen, 20u);
-            return true;
+            return BoxBoxManifold.Generate(a, aPose, b, bPose, ref m);
         }
 
         public static bool BoxCone(in BoxCollider a, in Pose aPose,
