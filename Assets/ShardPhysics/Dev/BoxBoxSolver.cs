@@ -1,6 +1,7 @@
 ﻿using System.Runtime.CompilerServices;
 using Unity.Mathematics;
 using UnityEngine;
+using static Shard.Dev.BoxBoxSolver;
 
 namespace Shard.Dev
 {
@@ -184,8 +185,23 @@ namespace Shard.Dev
             ComputedQuantities computedQuants = default;
             computedQuants.box1ToBox2CenterVec = box2.center - box1.center;
 
-            float minOverlap = float.MaxValue;
-            int minOverlapAxis = -1;
+            if (!SATOverlapTest(box1, box2, box1Axis, box2Axis, sepAxs, computedQuants.box1ToBox2CenterVec, out var minOverlap, out var minOverlapAxis)) return false;
+
+            // produce normal pointing from box1 to box2
+            bbcps.globalPenAxis = sepAxs[minOverlapAxis];
+            if (math.dot(bbcps.globalPenAxis, computedQuants.box1ToBox2CenterVec) < 0f)
+                bbcps.globalPenAxis = -bbcps.globalPenAxis;
+
+            bbcps.globalPenDepth = minOverlap;
+
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool SATOverlapTest(in Box box1, in Box box2, in BoxAxis box1Axis, in BoxAxis box2Axis, in SeparatingAxises sepAxs, float3 box1ToBox2CenterVec, out float minOverlap, out int minOverlapAxis)
+        {
+            minOverlap = float.MaxValue;
+            minOverlapAxis = -1;
 
             // sat overlap test
             for (int axisI = 0; axisI < SeparatingAxises.NUM_SEPARATING_AXIS; axisI++)
@@ -196,7 +212,7 @@ namespace Shard.Dev
                 var n = sepAxs[axisI];
                 var rA = ProjectRadii(box1, n, box1Axis);
                 var rB = ProjectRadii(box2, n, box2Axis);
-                var dist = math.abs(math.dot(computedQuants.box1ToBox2CenterVec, n));
+                var dist = math.abs(math.dot(box1ToBox2CenterVec, n));
                 var overlap = (rA + rB) - dist;
 
                 if (overlap < 0f) return false;
@@ -213,18 +229,11 @@ namespace Shard.Dev
                 }
             }
 
-            // produce normal pointing from box1 to box2
-            bbcps.globalPenAxis = sepAxs[minOverlapAxis];
-            if (math.dot(bbcps.globalPenAxis, computedQuants.box1ToBox2CenterVec) < 0f)
-                bbcps.globalPenAxis = -bbcps.globalPenAxis;
-
-            bbcps.globalPenDepth = minOverlap;
-
             return true;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static float ProjectRadii(in Box box, float3 n, in BoxAxis boxAxis)
+        private static float ProjectRadii(in Box box, float3 n, in BoxAxis boxAxis)
         {
             return box.halfExtents.x * math.abs(math.dot(n, boxAxis[0])) +
                    box.halfExtents.y * math.abs(math.dot(n, boxAxis[1])) +
@@ -233,7 +242,7 @@ namespace Shard.Dev
 
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static BoxAxis GetBoxAxis(Box box)
+        private static BoxAxis GetBoxAxis(Box box)
         {
             BoxAxis boxAxis = default;
             boxAxis.right = math.rotate(box.rot, math.right());
@@ -243,7 +252,7 @@ namespace Shard.Dev
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static SeparatingAxises ComputeSATAxisGroups(in BoxAxis a, in BoxAxis b)
+        private static SeparatingAxises ComputeSATAxisGroups(in BoxAxis a, in BoxAxis b)
         {
             SeparatingAxises groups = default;
 
