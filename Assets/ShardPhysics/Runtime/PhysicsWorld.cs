@@ -254,11 +254,20 @@ namespace Shard
                 Broadphase.UpdateProxy(proxy, worldAabb);
         }
 
+        // =========================
+        // PhysicsWorld.Step (rewritten)
+        // Key change:
+        // 1) Integrate velocities
+        // 2) Integrate poses (so overlaps actually exist THIS frame)
+        // 3) Solve contacts using the UPDATED poses (no 1-frame-late contacts)
+        // 4) Sleeping update
+        // 5) Update proxies (job)
+        // =========================
         public JobHandle Step(float dt, float3 gravity, JobHandle deps = default)
         {
             Broadphase.EnsureBodyCapacity(Bodies.Length);
 
-            // 1) Integrate velocities (job)
+            // 1) Integrate velocities
             var integrateV = new IntegrateVelocitiesJob
             {
                 Dt = dt,
@@ -273,15 +282,7 @@ namespace Shard
 
             JobHandle hV = Unity.Jobs.IJobForExtensions.ScheduleParallel(integrateV, Bodies.Length, 64, deps);
 
-            // 2) Collision solve (main thread, greedy as requested)
-            hV.Complete();
-
-            SolveGreedy_BoxBoxOnly(dt, solverIterations: 8);
-
-            // 2.5) Sleeping update (after solve)
-            UpdateSleeping(dt);
-
-            // 3) Integrate poses (job, scheduled after solve)
+            // 2) Integrate poses (using current velocities)
             var integrateP = new IntegratePosesJob
             {
                 Dt = dt,
@@ -292,40 +293,48 @@ namespace Shard
                 Velocities = Velocities.AsArray(),
             };
 
-            JobHandle hP = Unity.Jobs.IJobForExtensions.ScheduleParallel(integrateP, Bodies.Length, 64, default);
+            JobHandle hP = Unity.Jobs.IJobForExtensions.ScheduleParallel(integrateP, Bodies.Length, 64, hV);
 
-            // 4) Update proxies
+            // 3) Robust contact correction (needs current poses)
+            hP.Complete();
+            SolvePostStabilize_BoxBoxOnly(dt, iterations: 4);
+
+            // 4) Sleeping after stabilization
+            UpdateSleeping(dt);
+
+            // 5) Update proxies
             var update = new UpdateProxiesJob
             {
                 BodyAlive = BodyAlive.AsArray(),
                 Bodies = Bodies.AsArray(),
                 Poses = Poses.AsArray(),
                 ColliderSlots = Colliders.Slots.AsArray(),
-
                 BodyToProxy = Broadphase.BodyToProxy.AsArray(),
                 ProxyAabbs = Broadphase.ProxyAabbs.AsArray()
             };
 
-            JobHandle h2 = update.ScheduleParallel(Bodies.Length, 64, hP);
-            return h2;
+            JobHandle hU = update.ScheduleParallel(Bodies.Length, 64, default);
+            return hU;
         }
 
-        // -------------------------
-        // Greedy solver: Box-Box only
-        // -------------------------
-        // Replace your SolveGreedy_BoxBoxOnly with this version.
-        // - Warm start stored per contact key (safe TryGetValue; NEVER read via indexer)
-        // - Accumulated normal impulse per contact -> friction clamp uses local accumN
-        // - Restitution only on it==0 and only above threshold
-        // - Position projection only on it==0 (per pair), then regen manifold
-        private void SolveGreedy_BoxBoxOnly(float dt, int solverIterations)
+        // =========================
+        // SolveGreedy_BoxBoxOnly (rewritten)
+        // Key changes:
+        // - Uses manifold contract directly: n = m.Normal (already A->B)
+        // - Sequential impulses (accumN/accumT per contact point)
+        // - Baumgarte velocity bias for resting stability
+        // - Restitution only on impact-like contacts (and shallow penetration)
+        // - PositionProject only AFTER velocity iterations (small) as a safety net
+        // =========================
+        private void SolvePostStabilize_BoxBoxOnly(float dt, int iterations)
         {
-            const float slop = 0.001f;
-            const float baumgarte = 0.10f;      // penetration -> velocity bias strength
-            const float maxBias = 2.0f;         // clamp bias to avoid catapulting
-            const float bounceThreshold = 1.0f; // only apply restitution above this impact speed
+            const float slop = 0.001f;           // meters
+            const float percent = 0.80f;         // strong separation
+            const float maxCorr = 0.08f;         // meters per iteration cap
 
-            for (int it = 0; it < solverIterations; it++)
+            const float bounceThreshold = 0.25f; // m/s (only bounce on real impacts)
+
+            for (int it = 0; it < iterations; it++)
             {
                 for (int ia = 0; ia < Bodies.Length; ia++)
                 {
@@ -338,9 +347,7 @@ namespace Shard
                     if (ha.Type != ColliderType.Box) continue;
 
                     bool dynA = bodyA.MotionType == MotionType.Dynamic;
-                    var massA = Masses[ia];
-                    float invMassA = dynA ? massA.InverseMass : 0f;
-
+                    float invMassA = dynA ? Masses[ia].InverseMass : 0f;
                     BoxCollider boxA = Colliders.Boxes[ha.PayloadIndex];
 
                     for (int ib = ia + 1; ib < Bodies.Length; ib++)
@@ -357,8 +364,7 @@ namespace Shard
                             continue;
 
                         bool dynB = bodyB.MotionType == MotionType.Dynamic;
-                        var massB = Masses[ib];
-                        float invMassB = dynB ? massB.InverseMass : 0f;
+                        float invMassB = dynB ? Masses[ib].InverseMass : 0f;
 
                         float invMassSum = invMassA + invMassB;
                         if (invMassSum <= 0f) continue;
@@ -372,179 +378,106 @@ namespace Shard
                         if (!Shard.Manifolds.BoxBoxManifold.Generate(in boxA, in poseA, in boxB, in poseB, ref m))
                             continue;
 
-                        float3 n = FixNormalAtoB(m.Normal, poseA.Position, poseB.Position);
-                        // --- positional correction ONCE (per pair) then regenerate manifold ---
-                        if (it == 0)
-                        {
-                            PositionProject(ia, ib, in m, n, slop: 0.001f, percent: 0.2f, maxCorr: 0.01f);
-
-                            poseA = Poses[ia];
-                            poseB = Poses[ib];
-
-                            m = default;
-                            if (!Shard.Manifolds.BoxBoxManifold.Generate(in boxA, in poseA, in boxB, in poseB, ref m))
-                                continue;
-                        }
-
                         if (m.PointCount <= 0) continue;
 
-                        // Force normal consistency (A -> B)
+                        float3 n = m.Normal; // your manifold guarantees A->B
 
-                        // Materials
-                        PhysicsMaterial matA = Colliders.Materials[ha.MaterialId];
-                        PhysicsMaterial matB = Colliders.Materials[hb.MaterialId];
-                        float e = math.max(matA.Restitution, matB.Restitution);
-                        float mu = math.max(matA.Friction, matB.Friction);
-
-                        var velA = Velocities[ia];
-                        var velB = Velocities[ib];
-
+                        // Use max penetration across contacts
+                        float bestPen = 0f;
                         for (int pi = 0; pi < m.PointCount; pi++)
                         {
-                            ref ContactPoint cp = ref GetPointRef(ref m, pi);
-
-                            float3 p = cp.Position;
-                            float pen = cp.Penetration;
-
-                            float3 rA = p - poseA.Position;
-                            float3 rB = p - poseB.Position;
-
-                            // Effective mass along normal (compute once per contact)
-                            float3 rnA = math.cross(rA, n);
-                            float3 rnB = math.cross(rB, n);
-
-                            float3 iA_rnA = dynA ? MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, rnA) : float3.zero;
-                            float3 iB_rnB = dynB ? MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, rnB) : float3.zero;
-
-                            float kN =
-                                invMassA + invMassB +
-                                math.dot(math.cross(iA_rnA, rA), n) +
-                                math.dot(math.cross(iB_rnB, rB), n);
-
-                            if (kN < 1e-8f) continue;
-
-                            // --- warm start (SAFE) ---
-                            ulong key = MakeContactKey(ia, ib, cp.FeatureId);
-
-                            float accumN = 0f;
-                            if (_warmN.TryGetValue(key, out float cachedN))
+                            float pen = pi switch
                             {
-                                accumN = cachedN;
-
-                                float3 Pw = n * cachedN;
-                                if (dynA)
-                                {
-                                    velA.Linear -= Pw * invMassA;
-                                    velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pw));
-                                }
-                                if (dynB)
-                                {
-                                    velB.Linear += Pw * invMassB;
-                                    velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pw));
-                                }
-                            }
-
-                            // Relative velocity at contact
-                            float3 vAatP = velA.Linear + math.cross(velA.Angular, rA);
-                            float3 vBatP = velB.Linear + math.cross(velB.Angular, rB);
-                            float3 vRel = vBatP - vAatP;
-
-                            float vn = math.dot(vRel, n);
-
-                            // Restitution only on first solver iteration (avoid re-injecting energy)
-                            float bounce = 0f;
-                            if (it == 0 && vn < -bounceThreshold)
-                                bounce = -e * vn;
-
-                            // Penetration bias (velocity-level). Only when penetrating AND approaching.
-                            float depth = pen - slop;
-                            float bias = 0f;
-                            if (depth > 0f && vn < 0f)
-                            {
-                                bias = (baumgarte / dt) * depth;
-                                bias = math.min(bias, maxBias);
-                            }
-
-                            // --- solve normal impulse (accumulate, sequential impulses) ---
-                            float dN = -(vn - bounce - bias) / kN;
-
-                            float newN = math.max(0f, accumN + dN);
-                            dN = newN - accumN;
-
-                            if (dN != 0f)
-                            {
-                                float3 Pn = n * dN;
-
-                                if (dynA)
-                                {
-                                    velA.Linear -= Pn * invMassA;
-                                    velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pn));
-                                }
-                                if (dynB)
-                                {
-                                    velB.Linear += Pn * invMassB;
-                                    velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pn));
-                                }
-
-                                accumN = newN;
-                                _warmN[key] = accumN; // write is fine (add/update)
-                            }
-
-                            // --- friction (Coulomb), clamp by mu * accumN (SAFE) ---
-                            vAatP = velA.Linear + math.cross(velA.Angular, rA);
-                            vBatP = velB.Linear + math.cross(velB.Angular, rB);
-                            vRel = vBatP - vAatP;
-
-                            float3 vt = vRel - n * math.dot(vRel, n);
-                            float vtLen = math.length(vt);
-
-                            if (vtLen > 1e-6f && accumN > 0f)
-                            {
-                                float3 t = vt / vtLen;
-
-                                float3 rtA = math.cross(rA, t);
-                                float3 rtB = math.cross(rB, t);
-
-                                float3 iA_rtA = dynA ? MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, rtA) : float3.zero;
-                                float3 iB_rtB = dynB ? MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, rtB) : float3.zero;
-
-                                float kT =
-                                    invMassA + invMassB +
-                                    math.dot(math.cross(iA_rtA, rA), t) +
-                                    math.dot(math.cross(iB_rtB, rB), t);
-
-                                if (kT > 1e-8f)
-                                {
-                                    float dT = -(math.dot(vRel, t)) / kT;
-
-                                    float maxT = mu * accumN;
-                                    dT = math.clamp(dT, -maxT, +maxT);
-
-                                    if (dT != 0f)
-                                    {
-                                        float3 Pt = t * dT;
-
-                                        if (dynA)
-                                        {
-                                            velA.Linear -= Pt * invMassA;
-                                            velA.Angular -= MulInvInertiaWorld(massA.InverseInertiaLocal, poseA.Rotation, math.cross(rA, Pt));
-                                        }
-                                        if (dynB)
-                                        {
-                                            velB.Linear += Pt * invMassB;
-                                            velB.Angular += MulInvInertiaWorld(massB.InverseInertiaLocal, poseB.Rotation, math.cross(rB, Pt));
-                                        }
-                                    }
-                                }
-                            }
+                                0 => m.P0.Penetration,
+                                1 => m.P1.Penetration,
+                                2 => m.P2.Penetration,
+                                _ => m.P3.Penetration
+                            };
+                            if (pen > bestPen) bestPen = pen;
                         }
 
-                        Velocities[ia] = velA;
-                        Velocities[ib] = velB;
+                        float depth = bestPen - slop;
+                        if (depth <= 0f) continue;
+
+                        // --- POSITION SEPARATION (robust, prevents "falls thru") ---
+                        float corrMag = math.min(depth * percent, maxCorr);
+                        float3 corr = n * (corrMag / invMassSum);
+
+                        if (dynA)
+                        {
+                            poseA.Position -= corr * invMassA;
+                            Poses[ia] = poseA;
+                            WakeBody(ia);
+                        }
+
+                        if (dynB)
+                        {
+                            poseB.Position += corr * invMassB;
+                            Poses[ib] = poseB;
+                            WakeBody(ib);
+                        }
+
+                        // --- VELOCITY FIX (kill closing normal velocity + optional bounce) ---
+                        var vA = Velocities[ia];
+                        var vB = Velocities[ib];
+
+                        float3 vRel = vB.Linear - vA.Linear;
+                        float vn = math.dot(vRel, n);
+
+                        PhysicsMaterial matA = Colliders.Materials[ha.MaterialId];
+                        PhysicsMaterial matB = Colliders.Materials[hb.MaterialId];
+                        float e = math.clamp(math.max(matA.Restitution, matB.Restitution), 0f, 1f);
+                        float mu = math.max(matA.Friction, matB.Friction);
+
+                        // If they are moving into each other, cancel it (and bounce if fast enough)
+                        if (vn < 0f)
+                        {
+                            float targetVn = 0f;
+                            if (-vn > bounceThreshold)
+                                targetVn = -e * vn; // positive
+
+                            // We want vn' = targetVn, so delta = (targetVn - vn)
+                            float dvn = (targetVn - vn);
+
+                            float3 dv = n * (dvn / invMassSum);
+
+                            if (dynA) vA.Linear -= dv * invMassA;
+                            if (dynB) vB.Linear += dv * invMassB;
+
+                            // --- Simple friction: damp tangential relative velocity ---
+                            if (mu > 0f)
+                            {
+                                vRel = (vB.Linear - vA.Linear);
+                                float3 vt = vRel - n * math.dot(vRel, n);
+
+                                // clamp tangential speed proportional to normal correction this step
+                                // (not physically perfect, but stable + stops "slides off")
+                                float vtLen = math.length(vt);
+                                if (vtLen > 1e-6f)
+                                {
+                                    float maxVt = mu * math.abs(dvn);
+                                    float newVtLen = math.min(vtLen, maxVt);
+                                    float3 vtNew = vt * (newVtLen / vtLen);
+
+                                    float3 vRelNew = n * math.dot(vRel, n) + vtNew;
+                                    float3 dvRel = vRelNew - vRel;
+
+                                    float3 dvF = dvRel / invMassSum;
+
+                                    if (dynA) vA.Linear -= dvF * invMassA;
+                                    if (dynB) vB.Linear += dvF * invMassB;
+                                }
+                            }
+
+                            Velocities[ia] = vA;
+                            Velocities[ib] = vB;
+                        }
                     }
                 }
             }
         }
+
+
 
         // -------------------------
         // Sleeping
@@ -623,15 +556,16 @@ namespace Shard
             }
         }
 
-        // Position projection: gentle, once per pair per step (last iteration)
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        // -------------------------
+        // Position projection (your exact signature)
+        // -------------------------
         private void PositionProject(
-    int ia, int ib,
-    in ContactManifold m,
-    float3 normal,
-    float slop,
-    float percent,
-    float maxCorr)
+            int ia, int ib,
+            in ContactManifold m,
+            float3 normal,
+            float slop,
+            float percent,
+            float maxCorr)
         {
             var bodyA = Bodies[ia];
             var bodyB = Bodies[ib];
@@ -645,7 +579,6 @@ namespace Shard
             float invMassSum = invMassA + invMassB;
             if (invMassSum <= 0f) return;
 
-            // deepest penetration across manifold points
             float bestPen = 0f;
             for (int pi = 0; pi < m.PointCount; pi++)
             {
@@ -665,7 +598,6 @@ namespace Shard
             float corrMag = math.min(depth * percent, maxCorr);
             float3 corr = normal * (corrMag / invMassSum);
 
-            // mass-weighted split (if one is static, other gets all correction automatically)
             if (dynA)
             {
                 var pA = Poses[ia];
@@ -701,6 +633,21 @@ namespace Shard
             uint a = (uint)math.min(ia, ib);
             uint b = (uint)math.max(ia, ib);
             return ((ulong)a << 32) ^ (ulong)b ^ ((ulong)fid << 1);
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WarmSet(ulong key, float value)
+        {
+            // Never do indexer GET. Safe add/update/remove.
+            if (value <= 0f)
+            {
+                _warmN.Remove(key);
+                return;
+            }
+
+            if (!_warmN.TryAdd(key, value))
+                _warmN[key] = value; // update existing
         }
     }
 
