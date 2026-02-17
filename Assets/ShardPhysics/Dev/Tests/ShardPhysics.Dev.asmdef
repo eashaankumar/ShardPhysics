@@ -1,9 +1,10 @@
 {
-    "name": "ShardPhysics.Dev",
-    "rootNamespace": "Shard.Dev",
+    "name": "ShardPhysics.Dev.Tests",
+    "rootNamespace": "Shard.Dev.Tests",
     "references": [
         "GUID:e0cd26848372d4e5c891c569017e11f1",
-        "GUID:d8b63aba1907145bea998dd612889d6b"
+        "GUID:d8b63aba1907145bea998dd612889d6b",
+        "GUID:3d2f0b2f805f1204ea7a1b71ae4a5510"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
