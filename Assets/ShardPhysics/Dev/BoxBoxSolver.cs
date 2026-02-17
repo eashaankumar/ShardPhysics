@@ -170,6 +170,9 @@ namespace Shard.Dev
         public struct ComputedQuantities
         {
             public float3 box1ToBox2CenterVec;
+            public float minOverlap;
+            public int minOverlapAxis;
+            public float3 penAxis;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -185,14 +188,17 @@ namespace Shard.Dev
             ComputedQuantities computedQuants = default;
             computedQuants.box1ToBox2CenterVec = box2.center - box1.center;
 
-            if (!SATOverlapTest(box1, box2, box1Axis, box2Axis, sepAxs, computedQuants.box1ToBox2CenterVec, out var minOverlap, out var minOverlapAxis)) return false;
+            if (!SATOverlapTest(box1, box2, box1Axis, box2Axis, sepAxs, computedQuants.box1ToBox2CenterVec, out computedQuants.minOverlap, out computedQuants.minOverlapAxis)) return false;
 
             // produce normal pointing from box1 to box2
-            bbcps.globalPenAxis = sepAxs[minOverlapAxis];
-            if (math.dot(bbcps.globalPenAxis, computedQuants.box1ToBox2CenterVec) < 0f)
-                bbcps.globalPenAxis = -bbcps.globalPenAxis;
+            computedQuants.penAxis = sepAxs[computedQuants.minOverlapAxis];
+            if (math.dot(computedQuants.penAxis, computedQuants.box1ToBox2CenterVec) < 0f)
+                computedQuants.penAxis = -computedQuants.penAxis;
 
-            bbcps.globalPenDepth = minOverlap;
+            BoxBoxManifold.GenerateBoxBoxManifold(box1, box2, box1Axis, box2Axis, sepAxs, computedQuants, out bbcps);
+
+            bbcps.globalPenAxis = computedQuants.penAxis;
+            bbcps.globalPenDepth = computedQuants.minOverlap;
 
             return true;
         }
@@ -280,5 +286,29 @@ namespace Shard.Dev
 
             return groups;
         }
+
+        public struct BoxBoxManifold
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public static void GenerateBoxBoxManifold(in Box box1, in Box box2, in BoxAxis box1Axis, in BoxAxis box2Axis, in SeparatingAxises sepAxs, in ComputedQuantities computedQuants, out BoxBoxContactPoints bbcps)
+            {
+                bbcps = default;
+                var satCase = computedQuants.minOverlapAxis;
+
+                if (satCase < 3)
+                {
+                    // A face (Can be edge-face (but still face face))
+                }
+                else if (satCase < 6)
+                {
+                    // B face (Can be edge-face (but still face face))
+                }
+                else if (satCase < SeparatingAxises.NUM_SEPARATING_AXIS)
+                {
+                    // Edge edge
+                }
+            }
+        }
     }
+
 }
