@@ -6,6 +6,7 @@ namespace Shard.Dev.Tests
     {
         [SerializeField] Transform box1;
         [SerializeField] Transform box2;
+        [SerializeField] bool performPenConstraint;
 
 
         BoxBoxSolver.BoxBoxContactPoints cps;
@@ -18,6 +19,11 @@ namespace Shard.Dev.Tests
             if (collision)
             {
                 Debug.Log($"Collision! {Time.time}");
+                if (performPenConstraint)
+                {
+                    box1.transform.position -= (Vector3)cps.globalPenAxis * cps.globalPenDepth / 2;
+                    box2.transform.position += (Vector3)cps.globalPenAxis * cps.globalPenDepth / 2;
+                }
             }
         }
 

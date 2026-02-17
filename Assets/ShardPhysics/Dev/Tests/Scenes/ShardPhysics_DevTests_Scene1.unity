@@ -474,6 +474,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   box1: {fileID: 1204696408}
   box2: {fileID: 288420065}
+  performPenConstraint: 1
 --- !u!1 &1204696407
 GameObject:
   m_ObjectHideFlags: 0
