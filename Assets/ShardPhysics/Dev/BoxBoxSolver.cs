@@ -180,6 +180,9 @@ public struct BoxBoxSolver
         ComputedQuantities computedQuants = default;
         computedQuants.box1ToBox2CenterVec = box2.center - box1.center;
 
+        float minOverlap = float.MaxValue;
+        int minOverlapAxis = -1;
+
         // sat overlap test
         for(int axisI = 0; axisI < SeparatingAxises.NUM_SEPARATING_AXIS; axisI++)
         {
@@ -193,7 +196,23 @@ public struct BoxBoxSolver
             var overlap = (rA + rB) - dist;
 
             if (overlap < 0f) return false;
+
+            if (minOverlapAxis < 0)
+            {
+                minOverlapAxis = axisI;
+                minOverlap = overlap;
+            }
+            else if (overlap < minOverlap)
+            {
+                minOverlapAxis = axisI;
+                minOverlap = overlap;
+            }
         }
+
+        // produce normal pointing from box1 to box2
+        float3 penAxis = sepAxs[minOverlapAxis];
+        if (math.dot(penAxis, computedQuants.box1ToBox2CenterVec) < 0f)
+            penAxis = -penAxis;
 
         return true;
     }
