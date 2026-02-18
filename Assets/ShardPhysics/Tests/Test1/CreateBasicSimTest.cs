@@ -10,9 +10,10 @@ namespace Shard.Tests.Test1
     public class CreateBasicSimTest : MonoBehaviour
     {
         [SerializeField] Transform box1Trans;
+        [SerializeField] Transform box2Trans;
 
         ShardPhysicsWorld world;
-        ShardBodyHandle box1;
+        ShardBodyHandle box1, box2;
 
         private void Awake()
         {
@@ -29,6 +30,20 @@ namespace Shard.Tests.Test1
             });
 
             box1 = world.CreateBody(new Runtime.Pose { position = box1Trans.position, rotation = box1Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray(), new Velocity { linearVelocity=math.up() * 5, angularVelocity = new float3(0, 90 * math.TORADIANS, 0)});
+            world.SetBodyType(box1, BodyType.Static);
+
+
+
+            colliders.Clear();
+            colliders.Add(new ShardCollider
+            {
+                localPose = new Runtime.Pose { position = float3.zero, rotation = quaternion.identity },
+                type = ShardColliderType.Box,
+                density = 1.0f,
+                halfExtents = box2Trans.localScale / 2,
+            });
+            box2 = world.CreateBody(new Runtime.Pose { position = box2Trans.position, rotation = box2Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray());
+
 
             StartCoroutine(Tick());
         }
@@ -51,6 +66,12 @@ namespace Shard.Tests.Test1
                 {
                     box1Trans.position = pose.position;
                     box1Trans.rotation = pose.rotation;
+                }
+
+                if (world.TryGetPose(box2, out pose))
+                {
+                    box2Trans.position = pose.position;
+                    box2Trans.rotation = pose.rotation;
                 }
             }
         }

@@ -492,16 +492,21 @@ namespace Shard.Runtime
         }
         #endregion
 
+        #region ---------- Simulation/Integration/Solve ----------
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Simulate(float dt)
+        {
+            Integrate(dt);
+            SolveCollisions(dt);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void Integrate(float dt)
         {
             for (int i = 0; i < poses.Length; i++)
             {
                 BodyType type = bodyTypes[i];
-
-                // Always clear forces each step (you can choose to not clear for static/kinematic,
-                // but clearing avoids "surprise" accumulation).
-                // We'll clear at end for all paths.
 
                 if (type == BodyType.Static)
                 {
@@ -533,8 +538,7 @@ namespace Shard.Runtime
                 }
                 else // Kinematic
                 {
-                    // No force/torque/gravity effects.
-                    // But if user set v.linearVelocity / v.angularVelocity, we move accordingly.
+                    // velocity-driven kinematic (your current behavior)
                     p.position += v.linearVelocity * dt;
                     p.rotation = IntegrateRotation(p.rotation, v.angularVelocity, dt);
                 }
@@ -547,6 +551,161 @@ namespace Shard.Runtime
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SolveCollisions(float dt)
+        {
+            const float kRestitution = 0f;
+            const float kImpulseSlop = 1e-6f;
+            const float kDepthSlop = 1e-5f;
+
+            for (int a = 0; a < poses.Length; a++)
+            {
+                for (int b = a + 1; b < poses.Length; b++)
+                {
+                    bool aDyn = bodyTypes[a] == BodyType.Dynamic;
+                    bool bDyn = bodyTypes[b] == BodyType.Dynamic;
+                    if (!aDyn && !bDyn)
+                        continue;
+
+                    if (!TryGetBodyBoxHalfExtents(a, out float3 aHalf) ||
+                        !TryGetBodyBoxHalfExtents(b, out float3 bHalf))
+                        continue;
+
+                    Pose pa = poses[a];
+                    Pose pb = poses[b];
+
+                    var boxA = new BoxBoxSolver.Box(pa.position, pa.rotation, aHalf);
+                    var boxB = new BoxBoxSolver.Box(pb.position, pb.rotation, bHalf);
+
+                    if (!BoxBoxSolver.Solve(boxA, boxB, out BoxBoxSolver.BoxBoxContactPoints cps))
+                        continue;
+
+                    float3 n = cps.globalPenAxis;   // A -> B
+                    float depth = cps.globalPenDepth;
+                    if (depth <= kDepthSlop)
+                        continue;
+
+                    // ---- (1) Global penetration correction ONCE ----
+                    if (aDyn && bDyn)
+                    {
+                        float3 corr = n * (depth * 0.5f);
+                        pa.position -= corr;
+                        pb.position += corr;
+                        poses[a] = pa;
+                        poses[b] = pb;
+                    }
+                    else if (aDyn && !bDyn)
+                    {
+                        pa.position -= n * depth;
+                        poses[a] = pa;
+                    }
+                    else if (!aDyn && bDyn)
+                    {
+                        pb.position += n * depth;
+                        poses[b] = pb;
+                    }
+
+                    // Refresh poses after correction
+                    pa = poses[a];
+                    pb = poses[b];
+
+                    // ---- (2) Per-contact impulses ----
+                    int count = cps.numContactPoints;
+                    if (count <= 0)
+                        continue;
+
+                    Velocity va = velocities[a];
+                    Velocity vb = velocities[b];
+
+                    float invMassA = aDyn ? masses[a].invMass : 0f;
+                    float invMassB = bDyn ? masses[b].invMass : 0f;
+
+                    float3x3 invIworldA = float3x3.zero;
+                    float3x3 invIworldB = float3x3.zero;
+
+                    if (aDyn)
+                    {
+                        float3x3 R = new float3x3(pa.rotation);
+                        invIworldA = math.mul(R, math.mul(inertias[a].invInertia, math.transpose(R)));
+                    }
+                    if (bDyn)
+                    {
+                        float3x3 R = new float3x3(pb.rotation);
+                        invIworldB = math.mul(R, math.mul(inertias[b].invInertia, math.transpose(R)));
+                    }
+
+                    for (int ci = 0; ci < count; ci++)
+                    {
+                        var cp = cps[ci];
+                        float3 p = cp.point;
+
+                        float3 rA = p - pa.position;
+                        float3 rB = p - pb.position;
+
+                        float3 vA = va.linearVelocity + math.cross(va.angularVelocity, rA);
+                        float3 vB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
+                        float3 vRel = vB - vA;
+
+                        float vn = math.dot(vRel, n);
+
+                        // only if closing
+                        if (vn > -kImpulseSlop)
+                            continue;
+
+                        float3 rAxN = math.cross(rA, n);
+                        float3 rBxN = math.cross(rB, n);
+
+                        float3 angA = aDyn ? math.cross(math.mul(invIworldA, rAxN), rA) : float3.zero;
+                        float3 angB = bDyn ? math.cross(math.mul(invIworldB, rBxN), rB) : float3.zero;
+
+                        float denom = invMassA + invMassB + math.dot(n, angA + angB);
+                        if (denom <= 1e-12f)
+                            continue;
+
+                        float j = -(1f + kRestitution) * vn / denom;
+                        float3 impulse = n * j;
+
+                        if (aDyn)
+                        {
+                            va.linearVelocity -= impulse * invMassA;
+                            va.angularVelocity -= math.mul(invIworldA, rAxN * j);
+                        }
+                        if (bDyn)
+                        {
+                            vb.linearVelocity += impulse * invMassB;
+                            vb.angularVelocity += math.mul(invIworldB, rBxN * j);
+                        }
+                    }
+
+                    velocities[a] = va;
+                    velocities[b] = vb;
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetBodyBoxHalfExtents(int dense, out float3 halfExtents)
+        {
+            int n = colliderStore.GetHead(dense);
+            while (n != -1)
+            {
+                if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
+                    break;
+
+                if (c.type == ShardColliderType.Box)
+                {
+                    halfExtents = c.halfExtents;
+                    return true;
+                }
+
+                n = next;
+            }
+
+            halfExtents = default;
+            return false;
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static quaternion IntegrateRotation(quaternion q, float3 w, float dt)
         {
             // dq/dt = 0.5 * omega(q) * q
@@ -557,5 +716,6 @@ namespace Shard.Runtime
             // normalize to prevent drift
             return math.normalize(q);
         }
+        #endregion
     }
 }
