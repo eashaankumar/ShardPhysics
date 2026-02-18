@@ -41,6 +41,7 @@ namespace Shard.Runtime
             colliderStore.Dispose();
         }
 
+        #region --------- Create Body ----------
         public ShardBodyHandle CreateBody(Pose initialPose, float mass, float3x3 inertia, Velocity initialVel = default)
         {
             slotMap.Allocate(out int slot, out int dense);
@@ -62,6 +63,95 @@ namespace Shard.Runtime
 
             return new ShardBodyHandle(slot);
         }
+
+        /// <summary>
+        /// Create a rigid body from a set of colliders, computing inertia automatically.
+        /// - 'mass' is the final total body mass (unless mass <= 0 => static body).
+        /// - collider.density is used only for *relative weighting* between colliders.
+        ///   The final inertia is scaled so total mass == 'mass'.
+        /// </summary>
+        public ShardBodyHandle CreateBody(Pose initialPose, float mass, NativeArray<ShardCollider> colliders, Velocity initialVel = default)
+        {
+            // Static body convention: mass <= 0 => infinite mass + inertia.
+            if (mass <= 0f)
+            {
+                var hStatic = CreateBodyInternal(initialPose, 0f, float3x3.zero, initialVel);
+                for (int i = 0; i < colliders.Length; i++)
+                    AddCollider(hStatic, colliders[i]);
+                return hStatic;
+            }
+
+            ShardCreateBody.ComputeMassPropertiesFromColliders(
+                colliders,
+                desiredTotalMass: mass,
+                out float3x3 inertiaBody);
+
+            var h = CreateBodyInternal(initialPose, mass, inertiaBody, initialVel);
+
+            for (int i = 0; i < colliders.Length; i++)
+                AddCollider(h, colliders[i]);
+
+            return h;
+        }
+
+        /// <summary>
+        /// Managed convenience overload (no allocations). Useful from non-Burst callsites.
+        /// </summary>
+        public ShardBodyHandle CreateBody(Pose initialPose, float mass, ReadOnlySpan<ShardCollider> colliders, Velocity initialVel = default)
+        {
+            if (mass <= 0f)
+            {
+                var hStatic = CreateBodyInternal(initialPose, 0f, float3x3.zero, initialVel);
+                for (int i = 0; i < colliders.Length; i++)
+                    AddCollider(hStatic, colliders[i]);
+                return hStatic;
+            }
+
+            ShardCreateBody.ComputeMassPropertiesFromColliders(
+                colliders,
+                desiredTotalMass: mass,
+                out float3x3 inertiaBody);
+
+            var h = CreateBodyInternal(initialPose, mass, inertiaBody, initialVel);
+
+            for (int i = 0; i < colliders.Length; i++)
+                AddCollider(h, colliders[i]);
+
+            return h;
+        }
+
+        // ---- Internals ----
+
+        // Keep your original allocator/slotMap logic here, but factor it so the new overload can reuse it.
+        private ShardBodyHandle CreateBodyInternal(Pose initialPose, float mass, float3x3 inertia, Velocity initialVel)
+        {
+            slotMap.Allocate(out int slot, out int dense);
+
+            forceAccumulators.Add(new ForceAccumulator());
+            velocities.Add(initialVel);
+
+            if (mass <= 0f)
+            {
+                masses.Add(new Mass { mass = 0f, invMass = 0f });
+                inertias.Add(new Inertia { inertia = float3x3.zero, invInertia = float3x3.zero });
+            }
+            else
+            {
+                float m = math.max(mass, 1e-8f);
+                masses.Add(new Mass { mass = m, invMass = 1.0f / m });
+
+                // TODO later: SafeInverse3x3
+                inertias.Add(new Inertia { inertia = inertia, invInertia = math.inverse(inertia) });
+            }
+
+            poses.Add(initialPose);
+            colliderStore.OnBodyAdded();
+
+            return new ShardBodyHandle(slot);
+        }
+
+
+        #endregion
 
         public void DestroyBody(ShardBodyHandle h)
         {

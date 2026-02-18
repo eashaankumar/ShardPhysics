@@ -8,6 +8,10 @@ namespace Shard.Runtime
         Sphere,
         Box,
         Capsule,
+        Cylinder,
+        Cone,
+        Mesh,
+        Voxel
         // later: Convex, Mesh, Voxel, Heightfield...
     }
 
