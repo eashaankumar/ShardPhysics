@@ -28,7 +28,7 @@ namespace Shard.Tests.Test1
                 halfExtents = box1Trans.localScale/2,
             });
 
-            box1 = world.CreateBody(new Runtime.Pose { position = box1Trans.position, rotation = box1Trans.rotation }, 1, colliders.AsArray());
+            box1 = world.CreateBody(new Runtime.Pose { position = box1Trans.position, rotation = box1Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray(), new Velocity { linearVelocity=math.up() * 5, angularVelocity = new float3(0, 90 * math.TORADIANS, 0)});
 
             StartCoroutine(Tick());
         }

@@ -13,6 +13,7 @@ namespace Shard.Runtime
         NativeList<Mass> masses;
         NativeList<Inertia> inertias;
         NativeList<Pose> poses;
+        NativeList<BodyType> bodyTypes;
 
         DenseSlotMap slotMap;
         ShardColliderStore colliderStore;
@@ -26,6 +27,8 @@ namespace Shard.Runtime
             masses = new NativeList<Mass>(Allocator.Persistent);
             inertias = new NativeList<Inertia>(Allocator.Persistent);
             poses = new NativeList<Pose> (Allocator.Persistent);
+            bodyTypes = new NativeList<BodyType>(Allocator.Persistent);
+
             colliderStore = new ShardColliderStore(initialNodeCapacity: 32, initialBodyCapacity: 16, allocator: Allocator.Persistent);
             slotMap = new DenseSlotMap(initialCapacity: 16, allocator: Allocator.Persistent);
         }
@@ -37,45 +40,24 @@ namespace Shard.Runtime
             if (masses.IsCreated) masses.Dispose();
             if (inertias.IsCreated) inertias.Dispose();
             if (poses.IsCreated) poses.Dispose();
+            if (bodyTypes.IsCreated) bodyTypes.Dispose();
             slotMap.Dispose();
             colliderStore.Dispose();
         }
 
         #region --------- Create Body ----------
-        public ShardBodyHandle CreateBody(Pose initialPose, float mass, float3x3 inertia, Velocity initialVel = default)
-        {
-            slotMap.Allocate(out int slot, out int dense);
-
-            // Append dense data at index = dense
-
-            forceAccumulators.Add(new ForceAccumulator());
-            velocities.Add(initialVel);
-
-            float m = math.max(mass, 1e-8f);
-            masses.Add(new Mass { mass = m, invMass = 1.0f / m });
-
-            // You can replace this with SafeInverse later
-            inertias.Add(new Inertia { inertia = inertia, invInertia = math.inverse(inertia) });
-
-            poses.Add(initialPose);
-
-            colliderStore.OnBodyAdded();
-
-            return new ShardBodyHandle(slot);
-        }
-
         /// <summary>
         /// Create a rigid body from a set of colliders, computing inertia automatically.
         /// - 'mass' is the final total body mass (unless mass <= 0 => static body).
         /// - collider.density is used only for *relative weighting* between colliders.
         ///   The final inertia is scaled so total mass == 'mass'.
         /// </summary>
-        public ShardBodyHandle CreateBody(Pose initialPose, float mass, NativeArray<ShardCollider> colliders, Velocity initialVel = default)
+        public ShardBodyHandle CreateBody(Pose initialPose, BodyType type, float mass, NativeArray<ShardCollider> colliders, Velocity initialVel = default)
         {
             // Static body convention: mass <= 0 => infinite mass + inertia.
             if (mass <= 0f)
             {
-                var hStatic = CreateBodyInternal(initialPose, 0f, float3x3.zero, initialVel);
+                var hStatic = CreateBodyInternal(initialPose, type, 0f, float3x3.zero, initialVel);
                 for (int i = 0; i < colliders.Length; i++)
                     AddCollider(hStatic, colliders[i]);
                 return hStatic;
@@ -86,7 +68,7 @@ namespace Shard.Runtime
                 desiredTotalMass: mass,
                 out float3x3 inertiaBody);
 
-            var h = CreateBodyInternal(initialPose, mass, inertiaBody, initialVel);
+            var h = CreateBodyInternal(initialPose, type, mass, inertiaBody, initialVel);
 
             for (int i = 0; i < colliders.Length; i++)
                 AddCollider(h, colliders[i]);
@@ -97,11 +79,11 @@ namespace Shard.Runtime
         /// <summary>
         /// Managed convenience overload (no allocations). Useful from non-Burst callsites.
         /// </summary>
-        public ShardBodyHandle CreateBody(Pose initialPose, float mass, ReadOnlySpan<ShardCollider> colliders, Velocity initialVel = default)
+        public ShardBodyHandle CreateBody(Pose initialPose, BodyType type, float mass, ReadOnlySpan<ShardCollider> colliders, Velocity initialVel = default)
         {
             if (mass <= 0f)
             {
-                var hStatic = CreateBodyInternal(initialPose, 0f, float3x3.zero, initialVel);
+                var hStatic = CreateBodyInternal(initialPose, type, 0f, float3x3.zero, initialVel);
                 for (int i = 0; i < colliders.Length; i++)
                     AddCollider(hStatic, colliders[i]);
                 return hStatic;
@@ -112,7 +94,7 @@ namespace Shard.Runtime
                 desiredTotalMass: mass,
                 out float3x3 inertiaBody);
 
-            var h = CreateBodyInternal(initialPose, mass, inertiaBody, initialVel);
+            var h = CreateBodyInternal(initialPose, type, mass, inertiaBody, initialVel);
 
             for (int i = 0; i < colliders.Length; i++)
                 AddCollider(h, colliders[i]);
@@ -123,34 +105,47 @@ namespace Shard.Runtime
         // ---- Internals ----
 
         // Keep your original allocator/slotMap logic here, but factor it so the new overload can reuse it.
-        private ShardBodyHandle CreateBodyInternal(Pose initialPose, float mass, float3x3 inertia, Velocity initialVel)
+        private ShardBodyHandle CreateBodyInternal(Pose initialPose, BodyType type, float mass, float3x3 inertia, Velocity initialVel)
         {
             slotMap.Allocate(out int slot, out int dense);
 
             forceAccumulators.Add(new ForceAccumulator());
             velocities.Add(initialVel);
+            poses.Add(initialPose);
+            bodyTypes.Add(type);
 
-            if (mass <= 0f)
+            if (type == BodyType.Dynamic)
+            {
+                float m = math.max(mass, 1e-8f);
+                masses.Add(new Mass { mass = m, invMass = 1f / m });
+                inertias.Add(new Inertia { inertia = inertia, invInertia = math.inverse(inertia) }); // TODO SafeInverse later
+            }
+            else
             {
                 masses.Add(new Mass { mass = 0f, invMass = 0f });
                 inertias.Add(new Inertia { inertia = float3x3.zero, invInertia = float3x3.zero });
             }
-            else
-            {
-                float m = math.max(mass, 1e-8f);
-                masses.Add(new Mass { mass = m, invMass = 1.0f / m });
 
-                // TODO later: SafeInverse3x3
-                inertias.Add(new Inertia { inertia = inertia, invInertia = math.inverse(inertia) });
-            }
-
-            poses.Add(initialPose);
             colliderStore.OnBodyAdded();
-
             return new ShardBodyHandle(slot);
         }
 
+        public bool RecomputeMassProperties(ShardBodyHandle h, float desiredMassForDynamic)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
 
+            if (bodyTypes[d] != BodyType.Dynamic)
+                return false;
+
+            float m = math.max(desiredMassForDynamic, 1e-8f);
+            float3x3 inertiaBody = ComputeInertiaFromBodyColliders(d, m);
+
+            masses[d] = new Mass { mass = m, invMass = 1f / m };
+            inertias[d] = new Inertia { inertia = inertiaBody, invInertia = math.inverse(inertiaBody) };
+
+            return true;
+        }
         #endregion
 
         public void DestroyBody(ShardBodyHandle h)
@@ -171,6 +166,7 @@ namespace Shard.Runtime
                 velocities[dense] = velocities[last];
                 masses[dense] = masses[last];
                 inertias[dense] = inertias[last];
+                bodyTypes[dense] = bodyTypes[last];
 
                 // Move last body collider list into dense + fix owners
                 colliderStore.OnBodySwapMoved(fromDense: last, toDense: dense);
@@ -185,6 +181,7 @@ namespace Shard.Runtime
             velocities.RemoveAt(last);
             masses.RemoveAt(last);
             inertias.RemoveAt(last);
+            bodyTypes.RemoveAt(last);
 
             // Pop collider list row (always corresponds to last)
             colliderStore.OnBodyPoppedBack();
@@ -192,6 +189,75 @@ namespace Shard.Runtime
             // Free slot + pop dense mapping
             slotMap.Free(h.handle);
         }
+
+        #region ---------- Body Type ----------
+        public bool TryGetBodyType(ShardBodyHandle h, out BodyType type)
+        {
+            if (!TryGetDense(h, out int d))
+            {
+                type = default;
+                return false;
+            }
+            type = bodyTypes[d];
+            return true;
+        }
+
+        /// <summary>
+        /// Sets body type and auto-updates mass/inertia.
+        /// - For Dynamic: recomputes inertia from the body's colliders and sets mass.
+        /// - For Static/Kinematic: sets invMass=0 and invInertia=0.
+        /// </summary>
+        public bool SetBodyType(ShardBodyHandle h, BodyType newType, float desiredMassForDynamic = 1f)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            bodyTypes[d] = newType;
+
+            if (newType == BodyType.Dynamic)
+            {
+                float m = math.max(desiredMassForDynamic, 1e-8f);
+
+                // Gather colliders owned by this body and compute inertia
+                float3x3 inertiaBody = ComputeInertiaFromBodyColliders(d, m);
+
+                masses[d] = new Mass { mass = m, invMass = 1f / m };
+                inertias[d] = new Inertia { inertia = inertiaBody, invInertia = math.inverse(inertiaBody) }; // TODO SafeInverse later
+            }
+            else
+            {
+                // Static or Kinematic: infinite mass/inertia
+                masses[d] = new Mass { mass = 0f, invMass = 0f };
+                inertias[d] = new Inertia { inertia = float3x3.zero, invInertia = float3x3.zero };
+            }
+
+            return true;
+        }
+
+        private float3x3 ComputeInertiaFromBodyColliders(int dense, float desiredTotalMass)
+        {
+            // Pull colliders from linked list into a temp NativeList (Allocator.Temp = ok for infrequent edits)
+            var tmp = new NativeList<ShardCollider>(math.max(1, colliderStore.GetColliderCount(dense)), Allocator.Temp);
+
+            int n = colliderStore.GetHead(dense);
+            while (n != -1)
+            {
+                if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
+                    break;
+
+                tmp.Add(c);
+                n = next;
+            }
+
+            // Reuse your existing computation (this function should scale to desiredTotalMass)
+            ShardCreateBody.ComputeMassPropertiesFromColliders(tmp.AsArray(), desiredTotalMass, out float3x3 inertiaBody);
+
+            tmp.Dispose();
+            colliderStore.ClearDirty(dense);
+
+            return inertiaBody;
+        }
+        #endregion
 
         #region ---------- Colliders ----------
         public ShardColliderHandle AddCollider(ShardBodyHandle b, in ShardCollider collider)
@@ -431,37 +497,50 @@ namespace Shard.Runtime
         {
             for (int i = 0; i < poses.Length; i++)
             {
-                float invM = masses[i].invMass;
+                BodyType type = bodyTypes[i];
 
-                // Clear forces even for static bodies
-                // (or you can skip if you don't want them to accumulate)
-                if (invM == 0f)
+                // Always clear forces each step (you can choose to not clear for static/kinematic,
+                // but clearing avoids "surprise" accumulation).
+                // We'll clear at end for all paths.
+
+                if (type == BodyType.Static)
                 {
                     forceAccumulators[i].ClearAccumulators();
                     continue;
                 }
 
-                // Linear
-                float3 a = forceAccumulators[i].forceAccumulator * invM + gravity;
-                Velocity v = velocities[i];
-                v.linearVelocity += a * dt;
-
                 Pose p = poses[i];
-                p.position += v.linearVelocity * dt;
+                Velocity v = velocities[i];
 
-                // Angular (local inertia -> world inertia)
-                float3 torque = forceAccumulators[i].torqueAccumulator;
-                float3x3 invIlocal = inertias[i].invInertia;
-                float3x3 R = new float3x3(p.rotation);
-                float3x3 invIworld = math.mul(R, math.mul(invIlocal, math.transpose(R)));
+                if (type == BodyType.Dynamic)
+                {
+                    float invM = masses[i].invMass;
 
-                v.angularVelocity += math.mul(invIworld, torque) * dt;
+                    // Linear
+                    float3 a = forceAccumulators[i].forceAccumulator * invM + gravity;
+                    v.linearVelocity += a * dt;
+                    p.position += v.linearVelocity * dt;
 
-                // Integrate rotation from angular velocity (simple)
-                p.rotation = IntegrateRotation(p.rotation, v.angularVelocity, dt);
+                    // Angular
+                    float3 torque = forceAccumulators[i].torqueAccumulator;
 
-                velocities[i] = v;
+                    float3x3 invIlocal = inertias[i].invInertia;
+                    float3x3 R = new float3x3(p.rotation);
+                    float3x3 invIworld = math.mul(R, math.mul(invIlocal, math.transpose(R)));
+
+                    v.angularVelocity += math.mul(invIworld, torque) * dt;
+                    p.rotation = IntegrateRotation(p.rotation, v.angularVelocity, dt);
+                }
+                else // Kinematic
+                {
+                    // No force/torque/gravity effects.
+                    // But if user set v.linearVelocity / v.angularVelocity, we move accordingly.
+                    p.position += v.linearVelocity * dt;
+                    p.rotation = IntegrateRotation(p.rotation, v.angularVelocity, dt);
+                }
+
                 poses[i] = p;
+                velocities[i] = v;
 
                 forceAccumulators[i].ClearAccumulators();
             }

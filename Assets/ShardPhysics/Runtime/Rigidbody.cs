@@ -57,4 +57,11 @@ namespace Shard.Runtime
         }
         public bool IsValid => handle >= 0;
     }
+
+    public enum BodyType : byte
+    {
+        Static,    // invMass = 0, invInertia = 0, not integrated
+        Dynamic,   // invMass > 0, inertia computed
+        Kinematic  // invMass = 0, invInertia = 0, not integrated by forces (you move via SetPose)
+    }
 }
