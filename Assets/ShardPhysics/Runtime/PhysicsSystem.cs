@@ -110,7 +110,7 @@ namespace Shard.Runtime
             slotMap.Allocate(out int slot, out int dense);
 
             forceAccumulators.Add(new ForceAccumulator());
-            velocities.Add(initialVel);
+            velocities.Add(type == BodyType.Dynamic ? initialVel : default);
             poses.Add(initialPose);
             bodyTypes.Add(type);
 
@@ -124,6 +124,7 @@ namespace Shard.Runtime
             {
                 masses.Add(new Mass { mass = 0f, invMass = 0f });
                 inertias.Add(new Inertia { inertia = float3x3.zero, invInertia = float3x3.zero });
+
             }
 
             colliderStore.OnBodyAdded();
@@ -143,6 +144,9 @@ namespace Shard.Runtime
 
             masses[d] = new Mass { mass = m, invMass = 1f / m };
             inertias[d] = new Inertia { inertia = inertiaBody, invInertia = math.inverse(inertiaBody) };
+
+            velocities[d] = default;
+            forceAccumulators[d].ClearAccumulators();
 
             return true;
         }
@@ -229,6 +233,9 @@ namespace Shard.Runtime
                 // Static or Kinematic: infinite mass/inertia
                 masses[d] = new Mass { mass = 0f, invMass = 0f };
                 inertias[d] = new Inertia { inertia = float3x3.zero, invInertia = float3x3.zero };
+
+                velocities[d] = default;
+                forceAccumulators[d].ClearAccumulators();
             }
 
             return true;
@@ -579,7 +586,7 @@ namespace Shard.Runtime
                     if (!BoxBoxSolver.Solve(boxA, boxB, out BoxBoxSolver.BoxBoxContactPoints cps))
                         continue;
 
-                    float3 n = cps.globalPenAxis;   // A -> B
+                    float3 globalN = cps.globalPenAxis;   // A -> B
                     float depth = cps.globalPenDepth;
                     if (depth <= kDepthSlop)
                         continue;
@@ -587,7 +594,7 @@ namespace Shard.Runtime
                     // ---- (1) Global penetration correction ONCE ----
                     if (aDyn && bDyn)
                     {
-                        float3 corr = n * (depth * 0.5f);
+                        float3 corr = globalN * (depth * 0.5f);
                         pa.position -= corr;
                         pb.position += corr;
                         poses[a] = pa;
@@ -595,12 +602,12 @@ namespace Shard.Runtime
                     }
                     else if (aDyn && !bDyn)
                     {
-                        pa.position -= n * depth;
+                        pa.position -= globalN * depth;
                         poses[a] = pa;
                     }
                     else if (!aDyn && bDyn)
                     {
-                        pb.position += n * depth;
+                        pb.position += globalN * depth;
                         poses[b] = pb;
                     }
 
@@ -637,6 +644,7 @@ namespace Shard.Runtime
                     {
                         var cp = cps[ci];
                         float3 p = cp.point;
+                        float3 n = cp.normal;
 
                         float3 rA = p - pa.position;
                         float3 rB = p - pb.position;
