@@ -110,7 +110,7 @@ namespace Shard.Runtime
             slotMap.Allocate(out int slot, out int dense);
 
             forceAccumulators.Add(new ForceAccumulator());
-            velocities.Add(type == BodyType.Dynamic ? initialVel : default);
+            velocities.Add(type == BodyType.Static ? default : initialVel);
             poses.Add(initialPose);
             bodyTypes.Add(type);
 
@@ -234,8 +234,11 @@ namespace Shard.Runtime
                 masses[d] = new Mass { mass = 0f, invMass = 0f };
                 inertias[d] = new Inertia { inertia = float3x3.zero, invInertia = float3x3.zero };
 
-                velocities[d] = default;
-                forceAccumulators[d].ClearAccumulators();
+                if (newType == BodyType.Static)
+                {
+                    velocities[d] = default;              // static: kill motion
+                }
+                forceAccumulators[d].ClearAccumulators();  // both: clear forces
             }
 
             return true;
@@ -350,6 +353,25 @@ namespace Shard.Runtime
                 return false;
 
             poses[d] = pose;
+            return true;
+        }
+
+        public bool SetKinematicPose(ShardBodyHandle h, in Pose newPose, float dt)
+        {
+            if (!TryGetDense(h, out int d)) return false;
+            if (bodyTypes[d] != BodyType.Kinematic) return false;
+
+            Pose old = poses[d];
+
+            float3 linVel = (newPose.position - old.position) / math.max(dt, 1e-6f);
+            // angular vel estimate is optional; you can keep angularVelocity as user-authored for now
+
+            poses[d] = newPose;
+
+            var v = velocities[d];
+            v.linearVelocity = linVel;
+            velocities[d] = v;
+
             return true;
         }
         #endregion
@@ -522,6 +544,7 @@ namespace Shard.Runtime
 
                 if (type == BodyType.Static)
                 {
+                    velocities[i] = default;              // enforce invariant
                     forceAccumulators[i].ClearAccumulators();
                     continue;
                 }

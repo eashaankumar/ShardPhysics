@@ -53,6 +53,26 @@ namespace Shard.Tests.Test1
             world.Dispose();
         }
 
+        private void Update()
+        {
+            if (Input.GetKeyDown(KeyCode.Space))
+            {
+                if (world.TryGetBodyType(box1, out var t))
+                {
+                    Debug.Log(t);
+                    BodyType newType;
+                    if (t == BodyType.Static) newType = BodyType.Kinematic;
+                    else
+                    {
+                        newType = BodyType.Static;
+                    }
+
+                    world.SetBodyType(box1, newType);
+                    world.SetVelocity(box1, new Velocity { linearVelocity = math.up() * 5, angularVelocity = math.up() * 5 });
+                }
+            }
+        }
+
         IEnumerator Tick()
         {
             float dt = 1.0f / 60f;
