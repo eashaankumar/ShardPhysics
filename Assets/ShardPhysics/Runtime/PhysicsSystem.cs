@@ -89,6 +89,191 @@ namespace Shard.Runtime
             slotMap.Free(h.handle);
         }
 
+        #region ---------- Handle -> dense resolution ----------
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetDense(ShardBodyHandle h, out int dense)
+        {
+            return slotMap.TryResolveDense(h.handle, out dense);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool IsAlive(ShardBodyHandle h)
+        {
+            return slotMap.IsAlive(h.handle);
+        }
+        #endregion
+
+        #region ---------- Pose ----------
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetPose(ShardBodyHandle h, out Pose pose)
+        {
+            if (!TryGetDense(h, out int d))
+            {
+                pose = default;
+                return false;
+            }
+
+            pose = poses[d];
+            return true;
+        }
+
+        /// <summary>Teleport/set pose directly.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool SetPose(ShardBodyHandle h, in Pose pose)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            poses[d] = pose;
+            return true;
+        }
+        #endregion
+
+        #region ---------- Velocity ----------
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetVelocity(ShardBodyHandle h, out Velocity vel)
+        {
+            if (!TryGetDense(h, out int d))
+            {
+                vel = default;
+                return false;
+            }
+
+            vel = velocities[d];
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool SetVelocity(ShardBodyHandle h, in Velocity vel)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            velocities[d] = vel;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool SetLinearVelocity(ShardBodyHandle h, float3 v)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            var vel = velocities[d];
+            vel.linearVelocity = v;
+            velocities[d] = vel;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool SetAngularVelocity(ShardBodyHandle h, float3 w)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            var vel = velocities[d];
+            vel.angularVelocity = w;
+            velocities[d] = vel;
+            return true;
+        }
+        #endregion
+
+        #region ---------- Mass / Inertia ----------
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetMass(ShardBodyHandle h, out Mass mass)
+        {
+            if (!TryGetDense(h, out int d))
+            {
+                mass = default;
+                return false;
+            }
+
+            mass = masses[d];
+            return true;
+        }
+
+        /// <summary>
+        /// Sets mass and derived invMass. (Does NOT auto-recompute inertia distribution yet.)
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool SetMass(ShardBodyHandle h, float mass)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            float m = math.max(mass, 1e-8f);
+            masses[d] = new Mass { mass = m, invMass = 1.0f / m };
+
+            // TODO (later): if you store unit inertia, scale inertia/invInertia with mass here.
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetInertia(ShardBodyHandle h, out Inertia inertia)
+        {
+            if (!TryGetDense(h, out int d))
+            {
+                inertia = default;
+                return false;
+            }
+
+            inertia = inertias[d];
+            return true;
+        }
+
+        /// <summary>
+        /// Sets inertia tensors directly. Caller must provide valid (invertible) inertia.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool SetInertia(ShardBodyHandle h, in float3x3 inertia)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            // TODO: replace with SafeInverse3x3 later to prevent NaNs.
+            inertias[d] = new Inertia { inertia = inertia, invInertia = math.inverse(inertia) };
+            return true;
+        }
+        #endregion
+
+        #region ---------- Forces ----------
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool AddForce(ShardBodyHandle h, float3 force)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            var fa = forceAccumulators[d];
+            fa.forceAccumulator += force;
+            forceAccumulators[d] = fa;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool AddTorque(ShardBodyHandle h, float3 torque)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            var fa = forceAccumulators[d];
+            fa.torqueAccumulator += torque;
+            forceAccumulators[d] = fa;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool ClearForces(ShardBodyHandle h)
+        {
+            if (!TryGetDense(h, out int d))
+                return false;
+
+            var fa = forceAccumulators[d];
+            fa.ClearAccumulators();
+            forceAccumulators[d] = fa;
+            return true;
+        }
+        #endregion
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Simulate(float dt)
         {
