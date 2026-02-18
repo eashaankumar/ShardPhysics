@@ -649,9 +649,10 @@ namespace Shard.Runtime
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SolveCollisionsSinglePass(float dt)
         {
-            const float kRestitution = 0f;
             const float kImpulseSlop = 1e-6f;
             const float kDepthSlop = 1e-5f;
+            const float kStaticVelEps = 0.05f;  // m/s threshold to treat as “trying to stick”
+            const float kRollEps = 1e-8f;
 
             for (int a = 0; a < poses.Length; a++)
             {
@@ -662,9 +663,13 @@ namespace Shard.Runtime
                     if (!aDyn && !bDyn)
                         continue;
 
-                    if (!TryGetBodyBoxHalfExtents(a, out float3 aHalf) ||
-                        !TryGetBodyBoxHalfExtents(b, out float3 bHalf))
+                    // --- Fetch one box collider + material per body (your current assumption) ---
+                    if (!TryGetBodyBox(a, out float3 aHalf, out ShardColliderMaterial matA) ||
+                        !TryGetBodyBox(b, out float3 bHalf, out ShardColliderMaterial matB))
                         continue;
+
+                    // Combine materials for the pair
+                    CombineMaterials(matA, matB, out float restitution, out float muS, out float muD, out float muR);
 
                     Pose pa = poses[a];
                     Pose pb = poses[b];
@@ -675,12 +680,12 @@ namespace Shard.Runtime
                     if (!BoxBoxSolver.Solve(boxA, boxB, out BoxBoxSolver.BoxBoxContactPoints cps))
                         continue;
 
-                    float3 globalN = cps.globalPenAxis;   // A -> B
+                    float3 globalN = cps.globalPenAxis; // A -> B
                     float depth = cps.globalPenDepth;
                     if (depth <= kDepthSlop)
                         continue;
 
-                    // ---- (1) Global penetration correction ONCE ----
+                    // ---- (1) Global penetration correction (positional only) ----
                     if (aDyn && bDyn)
                     {
                         float3 corr = globalN * (depth * 0.5f);
@@ -700,11 +705,10 @@ namespace Shard.Runtime
                         poses[b] = pb;
                     }
 
-                    // Refresh poses after correction
+                    // refresh after correction
                     pa = poses[a];
                     pb = poses[b];
 
-                    // ---- (2) Per-contact impulses ----
                     int count = cps.numContactPoints;
                     if (count <= 0)
                         continue;
@@ -720,56 +724,148 @@ namespace Shard.Runtime
 
                     if (aDyn)
                     {
-                        float3x3 R = new float3x3(pa.rotation);
-                        invIworldA = math.mul(R, math.mul(inertias[a].invInertia, math.transpose(R)));
+                        float3x3 RA = new float3x3(pa.rotation);
+                        invIworldA = math.mul(RA, math.mul(inertias[a].invInertia, math.transpose(RA)));
                     }
                     if (bDyn)
                     {
-                        float3x3 R = new float3x3(pb.rotation);
-                        invIworldB = math.mul(R, math.mul(inertias[b].invInertia, math.transpose(R)));
+                        float3x3 RB = new float3x3(pb.rotation);
+                        invIworldB = math.mul(RB, math.mul(inertias[b].invInertia, math.transpose(RB)));
                     }
 
+                    // Solve per-contact impulses (normal + friction) + rolling “drag”
                     for (int ci = 0; ci < count; ci++)
                     {
                         var cp = cps[ci];
+
                         float3 p = cp.point;
+
+                        // Use the contact’s own normal (better than globalPenAxis for impulses)
                         float3 n = cp.normal;
+                        float nLenSq = math.lengthsq(n);
+                        if (nLenSq < 1e-12f)
+                            continue;
+                        n *= math.rsqrt(nLenSq);
 
                         float3 rA = p - pa.position;
                         float3 rB = p - pb.position;
 
-                        float3 vA = va.linearVelocity + math.cross(va.angularVelocity, rA);
-                        float3 vB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
-                        float3 vRel = vB - vA;
+                        float3 vPointA = va.linearVelocity + math.cross(va.angularVelocity, rA);
+                        float3 vPointB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
+                        float3 vRel = vPointB - vPointA;
 
                         float vn = math.dot(vRel, n);
 
-                        // only if closing
+                        // If separating (or basically not closing), don't apply contact impulse.
                         if (vn > -kImpulseSlop)
                             continue;
 
+                        // --- Normal impulse ---
                         float3 rAxN = math.cross(rA, n);
                         float3 rBxN = math.cross(rB, n);
 
-                        float3 angA = aDyn ? math.cross(math.mul(invIworldA, rAxN), rA) : float3.zero;
-                        float3 angB = bDyn ? math.cross(math.mul(invIworldB, rBxN), rB) : float3.zero;
+                        float3 angA_n = aDyn ? math.cross(math.mul(invIworldA, rAxN), rA) : float3.zero;
+                        float3 angB_n = bDyn ? math.cross(math.mul(invIworldB, rBxN), rB) : float3.zero;
 
-                        float denom = invMassA + invMassB + math.dot(n, angA + angB);
-                        if (denom <= 1e-12f)
+                        float denomN = invMassA + invMassB + math.dot(n, angA_n + angB_n);
+                        if (denomN <= 1e-12f)
                             continue;
 
-                        float j = -(1f + kRestitution) * vn / denom;
-                        float3 impulse = n * j;
+                        // Restitution: only meaningful when impact is “fast enough”
+                        float e = restitution;
+                        // Optional bounce threshold (prevents micro-bounce at rest)
+                        if (-vn < 1.0f) e = 0f;
+
+                        float jn = -(1f + e) * vn / denomN;
+                        if (jn < 0f) jn = 0f;
+
+                        float3 impulseN = n * jn;
 
                         if (aDyn)
                         {
-                            va.linearVelocity -= impulse * invMassA;
-                            va.angularVelocity -= math.mul(invIworldA, rAxN * j);
+                            va.linearVelocity -= impulseN * invMassA;
+                            va.angularVelocity -= math.mul(invIworldA, rAxN * jn);
                         }
                         if (bDyn)
                         {
-                            vb.linearVelocity += impulse * invMassB;
-                            vb.angularVelocity += math.mul(invIworldB, rBxN * j);
+                            vb.linearVelocity += impulseN * invMassB;
+                            vb.angularVelocity += math.mul(invIworldB, rBxN * jn);
+                        }
+
+                        // --- Tangential (static/dynamic) friction impulse ---
+                        // recompute relative velocity after normal impulse (more stable)
+                        vPointA = va.linearVelocity + math.cross(va.angularVelocity, rA);
+                        vPointB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
+                        vRel = vPointB - vPointA;
+
+                        float3 vt = vRel - n * math.dot(vRel, n);
+                        float vtLen = math.length(vt);
+
+                        if (vtLen > 1e-8f)
+                        {
+                            float3 t = vt / vtLen; // tangent dir
+
+                            float3 rAxT = math.cross(rA, t);
+                            float3 rBxT = math.cross(rB, t);
+
+                            float3 angA_t = aDyn ? math.cross(math.mul(invIworldA, rAxT), rA) : float3.zero;
+                            float3 angB_t = bDyn ? math.cross(math.mul(invIworldB, rBxT), rB) : float3.zero;
+
+                            float denomT = invMassA + invMassB + math.dot(t, angA_t + angB_t);
+                            if (denomT > 1e-12f)
+                            {
+                                float jt = -math.dot(vRel, t) / denomT;
+
+                                // Static vs dynamic: if we're “almost resting”, allow bigger (static) cap,
+                                // otherwise use dynamic cap.
+                                float maxStatic = muS * jn;
+                                float maxDynamic = muD * jn;
+
+                                float cap = (vtLen < kStaticVelEps) ? maxStatic : maxDynamic;
+
+                                jt = math.clamp(jt, -cap, cap);
+
+                                float3 impulseT = t * jt;
+
+                                if (aDyn)
+                                {
+                                    va.linearVelocity -= impulseT * invMassA;
+                                    va.angularVelocity -= math.mul(invIworldA, rAxT * jt);
+                                }
+                                if (bDyn)
+                                {
+                                    vb.linearVelocity += impulseT * invMassB;
+                                    vb.angularVelocity += math.mul(invIworldB, rBxT * jt);
+                                }
+                            }
+                        }
+
+                        // --- Rolling friction (cheap, contact-based angular damping) ---
+                        // Treat muR as “angular drag per unit normal impulse”.
+                        // This is not a perfect model, but feels right and is stable.
+                        if (muR > 0f && jn > 0f)
+                        {
+                            float k = muR * jn; // scale with contact strength
+                            if (aDyn)
+                            {
+                                float wLen = math.length(va.angularVelocity);
+                                if (wLen > kRollEps)
+                                {
+                                    float3 wDir = va.angularVelocity / wLen;
+                                    float wNew = math.max(0f, wLen - k);
+                                    va.angularVelocity = wDir * wNew;
+                                }
+                            }
+                            if (bDyn)
+                            {
+                                float wLen = math.length(vb.angularVelocity);
+                                if (wLen > kRollEps)
+                                {
+                                    float3 wDir = vb.angularVelocity / wLen;
+                                    float wNew = math.max(0f, wLen - k);
+                                    vb.angularVelocity = wDir * wNew;
+                                }
+                            }
                         }
                     }
 
@@ -780,7 +876,7 @@ namespace Shard.Runtime
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool TryGetBodyBoxHalfExtents(int dense, out float3 halfExtents)
+        private bool TryGetBodyBox(int dense, out float3 halfExtents, out ShardColliderMaterial mat)
         {
             int n = colliderStore.GetHead(dense);
             while (n != -1)
@@ -791,6 +887,7 @@ namespace Shard.Runtime
                 if (c.type == ShardColliderType.Box)
                 {
                     halfExtents = c.halfExtents;
+                    mat = c.material; // <--- your new field
                     return true;
                 }
 
@@ -798,7 +895,28 @@ namespace Shard.Runtime
             }
 
             halfExtents = default;
+            mat = default;
             return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void CombineMaterials(
+            in ShardColliderMaterial a,
+            in ShardColliderMaterial b,
+            out float restitution,
+            out float muS,
+            out float muD,
+            out float muR)
+        {
+            restitution = math.max(a.bounciness, b.bounciness);
+
+            // geometric mean (nice “middle ground”)
+            muS = math.sqrt(math.max(0f, a.frictionStatic) * math.max(0f, b.frictionStatic));
+            muD = math.sqrt(math.max(0f, a.frictionDynamic) * math.max(0f, b.frictionDynamic));
+            muR = math.sqrt(math.max(0f, a.frictionRolling) * math.max(0f, b.frictionRolling));
+
+            // enforce muD <= muS (helps stability)
+            muD = math.min(muD, muS);
         }
 
 

@@ -15,9 +15,19 @@ namespace Shard.Runtime
         // later: Convex, Mesh, Voxel, Heightfield...
     }
 
+    public struct ShardColliderMaterial
+    {
+        public float bounciness;
+        public float frictionStatic;
+        public float frictionDynamic;
+        public float frictionRolling;
+    }
+
     public struct ShardCollider
     {
         public ShardColliderType type;
+
+        public ShardColliderMaterial material;
 
         public Pose localPose;     // collider pose relative to body frame (body origin)
         public float density;      // optional; OR use body mass distribution later

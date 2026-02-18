@@ -23,10 +23,17 @@ namespace Shard.Tests.Test1
             NativeList<ShardCollider> colliders = new NativeList<ShardCollider>(Allocator.Temp);
             colliders.Add(new ShardCollider
             {
-                localPose=new Runtime.Pose { position=float3.zero, rotation=quaternion.identity },
+                localPose = new Runtime.Pose { position = float3.zero, rotation = quaternion.identity },
                 type = ShardColliderType.Box,
                 density = 1.0f,
-                halfExtents = box1Trans.localScale/2,
+                halfExtents = box1Trans.localScale / 2,
+                material = new ShardColliderMaterial
+                {
+                    bounciness = 0.2f,
+                    frictionDynamic = 1.0f,
+                    frictionStatic = 0.5f,
+                    frictionRolling = 0.2f
+                }
             });
 
             box1 = world.CreateBody(new Runtime.Pose { position = box1Trans.position, rotation = box1Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray(), new Velocity { linearVelocity=math.up() * 5, angularVelocity = new float3(0, 90 * math.TORADIANS, 0)});
