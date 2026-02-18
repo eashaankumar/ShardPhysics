@@ -396,7 +396,15 @@ namespace Shard.Runtime
             if (!TryGetDense(h, out int d))
                 return false;
 
-            velocities[d] = vel;
+            var type = bodyTypes[d];
+
+            if (type == BodyType.Static)
+            {
+                velocities[d] = default;   // enforce invariant
+                return true;               // or return false if you prefer strict behavior
+            }
+
+            velocities[d] = vel;          // Dynamic + Kinematic allowed
             return true;
         }
 
@@ -405,6 +413,13 @@ namespace Shard.Runtime
         {
             if (!TryGetDense(h, out int d))
                 return false;
+
+            var type = bodyTypes[d];
+            if (type == BodyType.Static)
+            {
+                velocities[d] = default;
+                return true;
+            }
 
             var vel = velocities[d];
             vel.linearVelocity = v;
@@ -417,6 +432,13 @@ namespace Shard.Runtime
         {
             if (!TryGetDense(h, out int d))
                 return false;
+
+            var type = bodyTypes[d];
+            if (type == BodyType.Static)
+            {
+                velocities[d] = default;
+                return true;
+            }
 
             var vel = velocities[d];
             vel.angularVelocity = w;
@@ -490,6 +512,9 @@ namespace Shard.Runtime
             if (!TryGetDense(h, out int d))
                 return false;
 
+            if (bodyTypes[d] != BodyType.Dynamic)
+                return true; // ignore for Static + Kinematic
+
             var fa = forceAccumulators[d];
             fa.forceAccumulator += force;
             forceAccumulators[d] = fa;
@@ -501,6 +526,9 @@ namespace Shard.Runtime
         {
             if (!TryGetDense(h, out int d))
                 return false;
+
+            if (bodyTypes[d] != BodyType.Dynamic)
+                return true; // ignore for Static + Kinematic
 
             var fa = forceAccumulators[d];
             fa.torqueAccumulator += torque;
@@ -526,12 +554,36 @@ namespace Shard.Runtime
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Simulate(float dt, int substeps=4, int collisionIterations = 6)
         {
+            EnforceTypeInvariants();
+
             float h = dt / substeps;
 
             for (int s = 0; s < substeps; s++)
             {
                 Integrate(h);
                 SolveCollisions(h, collisionIterations);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void EnforceTypeInvariants()
+        {
+            for (int i = 0; i < poses.Length; i++)
+            {
+                BodyType t = bodyTypes[i];
+
+                if (t == BodyType.Static)
+                {
+                    // Static: no motion, no forces.
+                    velocities[i] = default;
+                    forceAccumulators[i].ClearAccumulators();
+                }
+                else if (t == BodyType.Kinematic)
+                {
+                    // Kinematic: keep velocity (user-driven), but never accumulate forces.
+                    forceAccumulators[i].ClearAccumulators();
+                }
+                // Dynamic: do nothing
             }
         }
 
