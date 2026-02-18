@@ -41,8 +41,20 @@ namespace Shard.Runtime
     }
 
     [BurstCompile]
-    public struct ShardBody
+    public struct Pose
     {
-        public int slot;
+        public float3 position;
+        public quaternion rotation;
+    }
+
+    [BurstCompile]
+    public struct ShardBodyHandle
+    {
+        public readonly int handle;
+        internal ShardBodyHandle(int handle)
+        {
+            this.handle = handle;
+        }
+        public bool IsValid => handle >= 0;
     }
 }
