@@ -15,6 +15,7 @@ namespace Shard.Runtime
         NativeList<Pose> poses;
 
         DenseSlotMap slotMap;
+        ShardColliderStore colliderStore;
 
         public float3 gravity;
 
@@ -25,6 +26,7 @@ namespace Shard.Runtime
             masses = new NativeList<Mass>(Allocator.Persistent);
             inertias = new NativeList<Inertia>(Allocator.Persistent);
             poses = new NativeList<Pose> (Allocator.Persistent);
+            colliderStore = new ShardColliderStore(initialNodeCapacity: 32, initialBodyCapacity: 16, allocator: Allocator.Persistent);
             slotMap = new DenseSlotMap(initialCapacity: 16, allocator: Allocator.Persistent);
         }
 
@@ -36,6 +38,7 @@ namespace Shard.Runtime
             if (inertias.IsCreated) inertias.Dispose();
             if (poses.IsCreated) poses.Dispose();
             slotMap.Dispose();
+            colliderStore.Dispose();
         }
 
         public ShardBodyHandle CreateBody(Pose initialPose, float mass, float3x3 inertia, Velocity initialVel = default)
@@ -55,6 +58,8 @@ namespace Shard.Runtime
 
             poses.Add(initialPose);
 
+            colliderStore.OnBodyAdded();
+
             return new ShardBodyHandle(slot);
         }
 
@@ -63,31 +68,88 @@ namespace Shard.Runtime
             if (!slotMap.TryResolveDense(h.handle, out int dense))
                 return;
 
-            int last = poses.Length - 1; // or velocities.Length; must match all arrays
+            int last = poses.Length - 1;
+
+            // Free colliders owned by the body being destroyed (at dense)
+            colliderStore.OnBodyRemoving(dense);
 
             if (dense != last)
             {
-                // Swap-remove in all dense arrays
+                // Move last body data into dense
                 poses[dense] = poses[last];
                 forceAccumulators[dense] = forceAccumulators[last];
                 velocities[dense] = velocities[last];
                 masses[dense] = masses[last];
                 inertias[dense] = inertias[last];
 
-                // Update mapping for the moved element (last -> dense)
+                // Move last body collider list into dense + fix owners
+                colliderStore.OnBodySwapMoved(fromDense: last, toDense: dense);
+
+                // Update mapping for the moved body (last -> dense)
                 slotMap.OnDenseElementMoved(fromLastDense: last, toDense: dense);
             }
 
-            // Pop last from all dense arrays
+            // Pop dense arrays
             poses.RemoveAt(last);
             forceAccumulators.RemoveAt(last);
             velocities.RemoveAt(last);
             masses.RemoveAt(last);
             inertias.RemoveAt(last);
 
+            // Pop collider list row (always corresponds to last)
+            colliderStore.OnBodyPoppedBack();
+
             // Free slot + pop dense mapping
             slotMap.Free(h.handle);
         }
+
+        #region ---------- Colliders ----------
+        public ShardColliderHandle AddCollider(ShardBodyHandle b, in ShardCollider collider)
+        {
+            if (!TryGetDense(b, out int d))
+                return default;
+
+            return colliderStore.AddCollider(d, collider);
+        }
+
+        public bool RemoveCollider(ShardBodyHandle b, ShardColliderHandle c)
+        {
+            if (!TryGetDense(b, out int d))
+                return false;
+
+            return colliderStore.RemoveCollider(d, c);
+        }
+
+        public void ClearColliders(ShardBodyHandle b)
+        {
+            if (!TryGetDense(b, out int d))
+                return;
+
+            colliderStore.ClearColliders(d);
+        }
+
+        public bool TryGetCollider(ShardColliderHandle c, out ShardCollider collider)
+        {
+            return colliderStore.TryGetCollider(c, out collider, out _);
+        }
+
+        public bool SetCollider(ShardColliderHandle c, in ShardCollider collider)
+        {
+            return colliderStore.SetCollider(c, collider);
+        }
+
+        public bool SetColliderLocalPose(ShardColliderHandle c, in Pose localPose)
+        {
+            return colliderStore.SetColliderLocalPose(c, localPose);
+        }
+
+        public int GetColliderCount(ShardBodyHandle b)
+        {
+            if (!TryGetDense(b, out int d))
+                return 0;
+            return colliderStore.GetColliderCount(d);
+        }
+        #endregion
 
         #region ---------- Handle -> dense resolution ----------
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
