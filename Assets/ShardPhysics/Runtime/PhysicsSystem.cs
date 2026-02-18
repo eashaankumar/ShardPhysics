@@ -5,7 +5,7 @@ using Unity.Mathematics;
 
 namespace Shard.Runtime
 {
-    public class ShardPhysicsSystem : IDisposable
+    public class ShardPhysicsWorld : IDisposable
     {
 
         NativeList<ForceAccumulator> forceAccumulators;
@@ -18,7 +18,7 @@ namespace Shard.Runtime
 
         public float3 gravity;
 
-        public ShardPhysicsSystem()
+        public ShardPhysicsWorld()
         {
             forceAccumulators = new NativeList<ForceAccumulator>(Allocator.Persistent);
             velocities = new NativeList<Velocity>(Allocator.Persistent);
