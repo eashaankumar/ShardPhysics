@@ -502,10 +502,15 @@ namespace Shard.Runtime
         #region ---------- Simulation/Integration/Solve ----------
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Simulate(float dt)
+        public void Simulate(float dt, int substeps=4, int collisionIterations = 6)
         {
-            Integrate(dt);
-            SolveCollisions(dt);
+            float h = dt / substeps;
+
+            for (int s = 0; s < substeps; s++)
+            {
+                Integrate(h);
+                SolveCollisions(h, collisionIterations);
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -558,7 +563,16 @@ namespace Shard.Runtime
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SolveCollisions(float dt)
+        private void SolveCollisions(float dt, int iterations = 6)
+        {
+            for (int iter = 0; iter < iterations; iter++)
+            {
+                SolveCollisionsSinglePass(dt);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SolveCollisionsSinglePass(float dt)
         {
             const float kRestitution = 0f;
             const float kImpulseSlop = 1e-6f;
