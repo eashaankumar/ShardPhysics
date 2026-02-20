@@ -3,40 +3,10 @@ using System.Runtime.CompilerServices;
 using Unity.Mathematics;
 using UnityEngine;
 
-namespace Shard.Runtime
+namespace Shard.Runtime.Solvers
 {
     public struct BoxBoxSolver
     {
-        public struct ContactPoint
-        {
-            public float3 point;
-            public float3 normal;
-            public float depth;
-        }
-
-        public struct BoxBoxContactPoints
-        {
-            public ContactPoint p1;
-            public ContactPoint p2;
-            public ContactPoint p3;
-            public ContactPoint p4;
-            public int numContactPoints;
-            public float3 globalPenAxis;
-            public float globalPenDepth;
-
-            public ContactPoint this[int index]
-            {
-                get
-                {
-                    if (index == 0) return p1;
-                    if (index == 1) return p2;
-                    if (index == 2) return p3;
-                    if (index == 3) return p4;
-                    return default;
-                }
-            }
-        }
-
         public struct Box
         {
             public readonly float3 center;
@@ -191,7 +161,7 @@ namespace Shard.Runtime
         private const float SAT_OVERLAP_SLOP = 1e-5f; // or 1e-4f depending on scale
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool Solve(Box box1, Box box2, out BoxBoxContactPoints bbcps)
+        public static bool Solve(Box box1, Box box2, out ContactPointManifold bbcps)
         {
             bbcps = default;
 
@@ -314,7 +284,7 @@ namespace Shard.Runtime
                 in BoxAxis box1Axis, in BoxAxis box2Axis,
                 in SeparatingAxises sepAxs,
                 in ComputedQuantities computedQuants,
-                out BoxBoxContactPoints bbcps)
+                out ContactPointManifold bbcps)
             {
                 bbcps = default;
 
@@ -368,7 +338,7 @@ namespace Shard.Runtime
                 float globalDepth,     // SAT minOverlap (optional debug; not used for per-point depths below)
                 in Box box1, in Box box2,
                 in BoxAxis box1Axis, in BoxAxis box2Axis,
-                out BoxBoxContactPoints bbcps)
+                out ContactPointManifold bbcps)
             {
                 bbcps = default;
 
@@ -483,7 +453,7 @@ namespace Shard.Runtime
                 float globalDepth,     // SAT minOverlap (debug)
                 in Box box1, in Box box2,
                 in BoxAxis box1Axis, in BoxAxis box2Axis,
-                out BoxBoxContactPoints bbcps)
+                out ContactPointManifold bbcps)
             {
                 bbcps = default;
 

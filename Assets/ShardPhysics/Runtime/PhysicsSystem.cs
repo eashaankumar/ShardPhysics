@@ -1,3 +1,4 @@
+using Shard.Runtime.Solvers;
 using System;
 using System.Runtime.CompilerServices;
 using Unity.Collections;
@@ -663,22 +664,68 @@ namespace Shard.Runtime
                     if (!aDyn && !bDyn)
                         continue;
 
-                    // --- Fetch one box collider + material per body (your current assumption) ---
-                    if (!TryGetBodyBox(a, out float3 aHalf, out ShardColliderMaterial matA) ||
-                        !TryGetBodyBox(b, out float3 bHalf, out ShardColliderMaterial matB))
-                        continue;
-
-                    // Combine materials for the pair
-                    CombineMaterials(matA, matB, out float restitution, out float muS, out float muD, out float muR);
-
+                    ContactPointManifold cps = default;
+                    float restitution = 0, muS = 0, muD = 0, muR = 0;
                     Pose pa = poses[a];
                     Pose pb = poses[b];
 
-                    var boxA = new BoxBoxSolver.Box(pa.position, pa.rotation, aHalf);
-                    var boxB = new BoxBoxSolver.Box(pb.position, pb.rotation, bHalf);
+                    bool gotContact = false;
 
-                    if (!BoxBoxSolver.Solve(boxA, boxB, out BoxBoxSolver.BoxBoxContactPoints cps))
+                    // ---------- Box - Box ----------
+                    if (TryGetBodyBox(a, out float3 aHalf, out ShardColliderMaterial matA_box) &&
+                        TryGetBodyBox(b, out float3 bHalf, out ShardColliderMaterial matB_box))
+                    {
+                        CombineMaterials(matA_box, matB_box, out restitution, out muS, out muD, out muR);
+
+                        var boxA = new BoxBoxSolver.Box(pa.position, pa.rotation, aHalf);
+                        var boxB = new BoxBoxSolver.Box(pb.position, pb.rotation, bHalf);
+
+                        if (!BoxBoxSolver.Solve(boxA, boxB, out cps))
+                            continue;
+
+                        gotContact = true;
+                    }
+
+                    // ---------- Box - Cylinder (A = Box) ----------
+                    else if (TryGetBodyBox(a, out float3 boxHalf, out ShardColliderMaterial matBox) &&
+                             TryGetBodyCylinder(b, out float cylHH, out float cylR, out ShardColliderMaterial matCyl))
+                    {
+                        CombineMaterials(matBox, matCyl, out restitution, out muS, out muD, out muR);
+
+                        var box = new CylinderBoxSolver.Box(pa.position, pa.rotation, boxHalf);
+                        var cyl = new CylinderBoxSolver.Cylinder(pb.position, pb.rotation, cylHH, cylR);
+
+                        if (!CylinderBoxSolver.Solve(box, cyl, out cps))
+                            continue;
+
+                        // solver already returns box -> cyl (A -> B)
+                        gotContact = true;
+                    }
+
+                    // ---------- Cylinder - Box (A = Cylinder) ----------
+                    else if (TryGetBodyCylinder(a, out float cylHH2, out float cylR2, out ShardColliderMaterial matCyl2) &&
+                             TryGetBodyBox(b, out float3 boxHalf2, out ShardColliderMaterial matBox2))
+                    {
+                        CombineMaterials(matCyl2, matBox2, out restitution, out muS, out muD, out muR);
+
+                        var box = new CylinderBoxSolver.Box(pb.position, pb.rotation, boxHalf2);
+                        var cyl = new CylinderBoxSolver.Cylinder(pa.position, pa.rotation, cylHH2, cylR2);
+
+                        if (!CylinderBoxSolver.Solve(box, cyl, out cps))
+                            continue;
+
+                        // flip manifold (solver gives box->cyl, we need A->B)
+                        cps.globalPenAxis = -cps.globalPenAxis;
+
+                        for (int i = 0; i < cps.numContactPoints; i++)
+                            cps[i] = new ContactPoint { point = cps[i].point, normal = -cps[i].normal, depth = cps[i].depth };
+
+                        gotContact = true;
+                    }
+
+                    if (!gotContact)
                         continue;
+
 
                     float3 globalN = cps.globalPenAxis; // A -> B
                     float depth = cps.globalPenDepth;
@@ -895,6 +942,32 @@ namespace Shard.Runtime
             }
 
             halfExtents = default;
+            mat = default;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetBodyCylinder(int dense, out float halfHeight, out float radius, out ShardColliderMaterial mat)
+        {
+            int n = colliderStore.GetHead(dense);
+            while (n != -1)
+            {
+                if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
+                    break;
+
+                if (c.type == ShardColliderType.Cylinder)
+                {
+                    halfHeight = c.height/2;
+                    radius = c.radius;
+                    mat = c.material;
+                    return true;
+                }
+
+                n = next;
+            }
+
+            halfHeight = 0f;
+            radius = 0f;
             mat = default;
             return false;
         }
