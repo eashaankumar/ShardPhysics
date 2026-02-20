@@ -234,7 +234,7 @@ namespace Shard.Dev
                 float rBox = ProjectBoxRadii(in box, n, in boxAx);
 
                 // Cylinder inflated segment interval
-                ProjectCapsuleInterval(A, B, cyl.radius, n, out float minC, out float maxC);
+                ProjectCylinderInterval(in cyl, cylAxis, n, out float minC, out float maxC);
 
                 float cBox = math.dot(box.center, n);
                 float minB = cBox - rBox;
@@ -260,6 +260,21 @@ namespace Shard.Dev
             return box.halfExtents.x * math.abs(math.dot(n, ax[0])) +
                    box.halfExtents.y * math.abs(math.dot(n, ax[1])) +
                    box.halfExtents.z * math.abs(math.dot(n, ax[2]));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void ProjectCylinderInterval(in Cylinder cyl, float3 cylAxis, float3 n, out float min, out float max)
+        {
+            // n and cylAxis are expected unit.
+            float c = math.dot(cyl.center, n);
+
+            float a = math.abs(math.dot(cylAxis, n));                 // cosine between axis and n
+            float radial = math.sqrt(math.max(0f, 1f - a * a));       // sine magnitude
+
+            float extent = cyl.halfHeight * a + cyl.radius * radial;
+
+            min = c - extent;
+            max = c + extent;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

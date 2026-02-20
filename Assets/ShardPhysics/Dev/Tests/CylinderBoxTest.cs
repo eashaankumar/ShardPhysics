@@ -1,3 +1,4 @@
+using UnityEditor;
 using UnityEngine;
 
 namespace Shard.Dev.Tests
@@ -26,6 +27,11 @@ namespace Shard.Dev.Tests
 #if UNITY_EDITOR
         private void OnDrawGizmos()
         {
+
+            Handles.matrix = Matrix4x4.identity;
+            Handles.color = Color.green;
+            Handles.DrawWireDisc(cylinderTrans.position + cylinderTrans.up * cylinderTrans.localScale.y / 2, cylinderTrans.up, cylinderTrans.localScale.x / 2);
+
             if (!hit) return;
             for (int i = 0; i < cps.numContactPoints; i++)
             {
