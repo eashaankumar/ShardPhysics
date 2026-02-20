@@ -319,9 +319,11 @@ namespace Shard.Dev
                         return;
                 }
 
-                float3 p = ComputeDeepestContactPoint_BoxFaceVsCylinderSide(in box, in cyl, in boxAx, cylAxis, faceAxis, globalN);
-                WriteContact(ref cbcp.p1, p, globalN, comp.minOverlap);
-                cbcp.numContactPoints = 1;
+                BuildBoxFaceVsCylinderSideManifold(
+                    in box, in cyl, in boxAx, cylAxis,
+                    faceAxis, globalN, comp.minOverlap,
+                    out cbcp
+                );
                 return;
             }
 
@@ -388,6 +390,101 @@ namespace Shard.Dev
             }
 
             return cyl.center + math.rotate(cyl.rot, pL);
+        }
+
+        private static void BuildBoxFaceVsCylinderSideManifold(
+            in Box box,
+            in Cylinder cyl,
+            in BoxAxis boxAx,
+            float3 cylAxis,
+            int faceAxis,      // 0..2
+            float3 globalN,    // box -> cyl (oriented)
+            float globalDepth,
+            out CylinderBoxContactPoints cbcp)
+        {
+            cbcp = default;
+
+            // Oriented face normal (box -> cyl)
+            float3 faceN = boxAx[faceAxis];
+            if (math.dot(faceN, globalN) < 0f) faceN = -faceN;
+
+            float faceHalf = GetHalf(box.halfExtents, faceAxis);
+            float3 faceCenter = box.center + faceN * faceHalf;
+
+            // Compute one deepest point on the cylinder side at each end (t = +/- halfHeight)
+            float3 cylP0 = DeepestSidePointAtAxisOffset(in cyl, cylAxis, -cyl.halfHeight, faceN);
+            float3 cylP1 = DeepestSidePointAtAxisOffset(in cyl, cylAxis, +cyl.halfHeight, faceN);
+
+            // Signed distance to the face plane (positive = in front of plane along faceN)
+            float d0 = math.dot(faceN, cylP0 - faceCenter);
+            float d1 = math.dot(faceN, cylP1 - faceCenter);
+
+            // "Penetrating" means behind the plane. Use a small slop so grazing doesn’t spam 2 points.
+            const float planePenEps = 1e-4f;
+            bool pen0 = d0 <= planePenEps;
+            bool pen1 = d1 <= planePenEps;
+
+            // Project cylinder witness points onto the box face plane (stable contact point on box)
+            float3 onPlane0 = cylP0 - faceN * d0;
+            float3 onPlane1 = cylP1 - faceN * d1;
+
+            // If both ends penetrate => 2-point manifold (supports along the side)
+            if (pen0 && pen1)
+            {
+                // De-dupe in case halfHeight ~ 0 or extreme degeneracy
+                if (math.lengthsq(onPlane1 - onPlane0) <= 1e-8f)
+                {
+                    WriteContact(ref cbcp.p1, onPlane0, globalN, globalDepth);
+                    cbcp.numContactPoints = 1;
+                    return;
+                }
+
+                WriteContact(ref cbcp.p1, onPlane0, globalN, globalDepth);
+                WriteContact(ref cbcp.p2, onPlane1, globalN, globalDepth);
+                cbcp.numContactPoints = 2;
+                return;
+            }
+
+            // Otherwise emit ONLY ONE: the deeper of the two (most negative distance)
+            // If only one penetrates, this automatically picks it.
+            if (d1 < d0)
+            {
+                WriteContact(ref cbcp.p1, onPlane1, globalN, globalDepth);
+                cbcp.numContactPoints = 1;
+            }
+            else
+            {
+                WriteContact(ref cbcp.p1, onPlane0, globalN, globalDepth);
+                cbcp.numContactPoints = 1;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 DeepestSidePointAtAxisOffset(
+            in Cylinder cyl,
+            float3 cylAxis,     // unit
+            float t,            // along axis in [-halfHeight, +halfHeight]
+            float3 faceN)       // oriented box face normal (box -> cyl)
+        {
+            // cap/end center on cylinder axis
+            float3 endCenter = cyl.center + cylAxis * t;
+
+            // We want the point on the circular rim (perpendicular to cylAxis) that is deepest behind the plane.
+            // That is in direction -faceN projected into the rim plane.
+            float3 d = -faceN;
+
+            // Remove component along axis to get a rim-plane direction
+            float3 radial = d - cylAxis * math.dot(d, cylAxis);
+            float radialLenSq = math.lengthsq(radial);
+
+            if (radialLenSq <= 1e-12f)
+            {
+                // Plane normal aligned with cylinder axis => deepest at end center (no unique rim direction)
+                return endCenter;
+            }
+
+            radial *= math.rsqrt(radialLenSq);
+            return endCenter + radial * cyl.radius;
         }
 
         // --- Cap-on-face: rim points on the box face ---
