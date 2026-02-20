@@ -696,7 +696,10 @@ namespace Shard.Runtime
                         var cyl = new CylinderBoxSolver.Cylinder(pb.position, pb.rotation, cylHH, cylR);
 
                         if (!CylinderBoxSolver.Solve(box, cyl, out cps))
+                        {
+                            UnityEngine.Debug.Log("Nonone" + UnityEngine.Time.time);
                             continue;
+                        }
 
                         // solver already returns box -> cyl (A -> B)
                         gotContact = true;
@@ -712,7 +715,10 @@ namespace Shard.Runtime
                         var cyl = new CylinderBoxSolver.Cylinder(pa.position, pa.rotation, cylHH2, cylR2);
 
                         if (!CylinderBoxSolver.Solve(box, cyl, out cps))
+                        {
+                            UnityEngine.Debug.Log("Nonone" + UnityEngine.Time.time);
                             continue;
+                        }
 
                         // flip manifold (solver gives box->cyl, we need A->B)
                         cps.globalPenAxis = -cps.globalPenAxis;

@@ -1,6 +1,8 @@
 using Shard.Runtime;
+using Shard.Runtime.Solvers;
 using System.Collections;
 using System.Collections.Generic;
+using Unity.Burst.CompilerServices;
 using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine;
@@ -11,9 +13,10 @@ namespace Shard.Tests.Test1
     {
         [SerializeField] Transform box1Trans;
         [SerializeField] Transform box2Trans;
+        [SerializeField] Transform cyl1Trans;
 
         ShardPhysicsWorld world;
-        ShardBodyHandle box1, box2;
+        ShardBodyHandle box1, box2, cylinder1;
 
         private void Awake()
         {
@@ -48,9 +51,32 @@ namespace Shard.Tests.Test1
                 type = ShardColliderType.Box,
                 density = 1.0f,
                 halfExtents = box2Trans.localScale / 2,
+                material = new ShardColliderMaterial
+                {
+                    bounciness = 0.2f,
+                    frictionDynamic = 1.0f,
+                    frictionStatic = 0.5f,
+                    frictionRolling = 0.2f
+                }
             });
             box2 = world.CreateBody(new Runtime.Pose { position = box2Trans.position, rotation = box2Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray());
 
+            colliders.Clear();
+            colliders.Add(new ShardCollider
+            {
+                localPose = new Runtime.Pose { position = float3.zero, rotation = quaternion.identity },
+                type = ShardColliderType.Cylinder,
+                height = 1.0f,
+                radius = 0.5f,
+                material = new ShardColliderMaterial
+                {
+                    bounciness = 0.2f,
+                    frictionDynamic = 1.0f,
+                    frictionStatic = 0.5f,
+                    frictionRolling = 0.2f
+                }
+            });
+            cylinder1 = world.CreateBody(new Runtime.Pose { position = cyl1Trans.position, rotation = cyl1Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray());
 
             StartCoroutine(Tick());
         }
@@ -89,16 +115,47 @@ namespace Shard.Tests.Test1
 
                 world.Simulate(dt);
 
-                if(world.TryGetPose(box1, out var pose))
+                //hit = CylinderBoxSolver.Solve(new CylinderBoxSolver.Box(boxTrans.position, boxTrans.rotation, boxTrans.localScale / 2),
+                //                    new CylinderBoxSolver.Cylinder(cylinderTrans.position, cylinderTrans.rotation, cylinderTrans.localScale.y / 2, cylinderTrans.localScale.x / 2),
+                //                    out cps);
+
+                //if (hit)
+                //{
+                //    Debug.Log("Cylinder box hit! " + Time.time);
+                //}
+                //print(hit);
+
+                if (world.TryGetPose(box1, out var pose))
                 {
                     box1Trans.position = pose.position;
                     box1Trans.rotation = pose.rotation;
+                    box1Trans.gameObject.SetActive(true);
+                }
+                else
+                {
+                    box1Trans.gameObject.SetActive(false);
                 }
 
                 if (world.TryGetPose(box2, out pose))
                 {
                     box2Trans.position = pose.position;
                     box2Trans.rotation = pose.rotation;
+                    box2Trans.gameObject.SetActive(true);
+                }
+                else
+                {
+                    box2Trans.gameObject.SetActive(false);
+                }
+
+                if (world.TryGetPose(cylinder1, out pose))
+                {
+                    cyl1Trans.position = pose.position;
+                    cyl1Trans.rotation = pose.rotation;
+                    cyl1Trans.gameObject.SetActive(true);
+                }
+                else
+                {
+                    cyl1Trans.gameObject.SetActive(false);
                 }
             }
         }
