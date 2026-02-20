@@ -51,13 +51,13 @@ namespace Shard.Tests.Test1
                 type = ShardColliderType.Box,
                 density = 1.0f,
                 halfExtents = box2Trans.localScale / 2,
-                material = new ShardColliderMaterial
-                {
-                    bounciness = 0.2f,
-                    frictionDynamic = 1.0f,
-                    frictionStatic = 0.5f,
-                    frictionRolling = 0.2f
-                }
+                //material = new ShardColliderMaterial
+                //{
+                //    bounciness = 0.2f,
+                //    frictionDynamic = 1.0f,
+                //    frictionStatic = 0.5f,
+                //    frictionRolling = 0.2f
+                //}
             });
             box2 = world.CreateBody(new Runtime.Pose { position = box2Trans.position, rotation = box2Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray());
 
@@ -68,13 +68,14 @@ namespace Shard.Tests.Test1
                 type = ShardColliderType.Cylinder,
                 height = 1.0f,
                 radius = 0.5f,
-                material = new ShardColliderMaterial
-                {
-                    bounciness = 0.2f,
-                    frictionDynamic = 1.0f,
-                    frictionStatic = 0.5f,
-                    frictionRolling = 0.2f
-                }
+                density = 1.0f,
+                //material = new ShardColliderMaterial
+                //{
+                //    bounciness = 0.2f,
+                //    frictionDynamic = 1.0f,
+                //    frictionStatic = 0.5f,
+                //    frictionRolling = 0.2f
+                //}
             });
             cylinder1 = world.CreateBody(new Runtime.Pose { position = cyl1Trans.position, rotation = cyl1Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray());
 

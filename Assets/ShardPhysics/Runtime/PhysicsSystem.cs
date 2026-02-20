@@ -809,9 +809,16 @@ namespace Shard.Runtime
 
                         float vn = math.dot(vRel, n);
 
-                        // If separating (or basically not closing), don't apply contact impulse.
-                        if (vn > -kImpulseSlop)
-                            continue;
+                        // ---------------- Bias (Baumgarte stabilization) ----------------
+                        const float beta = 0.2f;         // 0.1–0.3 is typical
+                        const float allowedPen = 1e-4f;
+
+                        float pen = math.max(0f, depth - allowedPen);
+                        float biasVel = (pen > 0f)
+                            ? (beta * pen / math.max(dt, 1e-6f))
+                            : 0f;
+                        // ---------------------------------------------------------------
+
 
                         // --- Normal impulse ---
                         float3 rAxN = math.cross(rA, n);
@@ -824,13 +831,19 @@ namespace Shard.Runtime
                         if (denomN <= 1e-12f)
                             continue;
 
-                        // Restitution: only meaningful when impact is “fast enough”
+
+                        // Restitution only for real impacts
                         float e = restitution;
-                        // Optional bounce threshold (prevents micro-bounce at rest)
                         if (-vn < 1.0f) e = 0f;
 
-                        float jn = -(1f + e) * vn / denomN;
+
+                        // Solve impulse with bias
+                        float jn = (-(1f + e) * vn + biasVel) / denomN;
+
+
+                        // Clamp (no pulling forces)
                         if (jn < 0f) jn = 0f;
+
 
                         float3 impulseN = n * jn;
 
