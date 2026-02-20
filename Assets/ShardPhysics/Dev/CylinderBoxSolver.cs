@@ -197,10 +197,10 @@ namespace Shard.Dev
             if (math.dot(comp.penAxis, comp.boxToCyl) < 0f)
                 comp.penAxis = -comp.penAxis;
 
+            GenerateManifold(in box, in cyl, in boxAx, cylAxis, in axes, in comp, out cbcp);
+
             cbcp.globalPenAxis = comp.penAxis;
             cbcp.globalPenDepth = comp.minOverlap;
-
-            GenerateManifold(in box, in cyl, in boxAx, cylAxis, in axes, in comp, out cbcp);
 
             return cbcp.numContactPoints > 0;
         }
