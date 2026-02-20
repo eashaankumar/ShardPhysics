@@ -291,60 +291,119 @@ namespace Shard.Dev
         // ------------------------------------------------------------
 
         private static void GenerateManifold(
-            in Box box, in Cylinder cyl,
-            in BoxAxis boxAx, float3 cylAxis,
-            in SeparatingAxes axes,
-            in Computed comp,
-            out CylinderBoxContactPoints cbcp)
+             in Box box, in Cylinder cyl,
+             in BoxAxis boxAx, float3 cylAxis,
+             in SeparatingAxes axes,
+             in Computed comp,
+             out CylinderBoxContactPoints cbcp)
         {
             cbcp = default;
 
             float3 globalN = comp.penAxis; // box -> cyl
 
-            // If the winning axis is a box face axis (0..2), we can do a nice face manifold.
             if (comp.minAxis >= 0 && comp.minAxis <= 2)
             {
                 int faceAxis = comp.minAxis;
 
-                // Cap-on-face condition: cylinder axis ~ parallel to face normal (perpendicular to face plane)
-                // globalN ~ +/- cylAxis
-                float align = math.abs(math.dot(globalN, cylAxis));
-                if (align > 0.9f)
+                // Oriented box face normal for that axis, pointing box -> cyl
+                float3 faceN = boxAx[faceAxis];
+                if (math.dot(faceN, globalN) < 0f)
+                    faceN = -faceN;
+
+                // Cap-on-face: ONLY if cylAxis is extremely parallel to that face normal.
+                // (Otherwise you are NOT in a true cap contact scenario.)
+                float align = math.abs(math.dot(faceN, cylAxis));
+                if (align > 0.9995f)
                 {
-                    if (BuildCapOnFaceRimManifold(in box, in cyl, in boxAx, cylAxis, faceAxis, globalN, comp.minOverlap, out cbcp))
+                    if (BuildCapOnFaceRimManifold(in box, in cyl, in boxAx, cylAxis, faceAxis, faceN, comp.minOverlap, out cbcp))
                         return;
                 }
 
-                // Otherwise use side/feature manifold (1-2 points) based on closest segment↔OBB
-                BuildClosestFeatureManifold(in box, in cyl, in boxAx, cylAxis, globalN, comp.minOverlap, out cbcp);
+                float3 p = ComputeDeepestContactPoint_BoxFaceVsCylinderSide(in box, in cyl, in boxAx, cylAxis, faceAxis, globalN);
+                WriteContact(ref cbcp.p1, p, globalN, comp.minOverlap);
+                cbcp.numContactPoints = 1;
                 return;
             }
 
-            // If winning axis is cylinder axis (3) or a cross axis (4..6), keep it robust:
-            // generate a closest-feature contact (optionally 2 points).
             BuildClosestFeatureManifold(in box, in cyl, in boxAx, cylAxis, globalN, comp.minOverlap, out cbcp);
+        }
+
+        private static float3 ComputeDeepestContactPoint_BoxFaceVsCylinderSide(
+            in Box box,
+            in Cylinder cyl,
+            in BoxAxis boxAx,
+            float3 cylAxis,
+            int faceAxis,     // 0..2 box axis index (winning axis)
+            float3 globalN)   // box -> cyl (oriented)
+        {
+            // Oriented face normal (box -> cyl) for the reference face plane
+            float3 faceN = boxAx[faceAxis];
+            if (math.dot(faceN, globalN) < 0f) faceN = -faceN;
+
+            // Plane point: the actual box face center
+            float faceHalf = GetHalf(box.halfExtents, faceAxis);
+            float3 faceCenter = box.center + faceN * faceHalf;
+
+            // Deepest point on the CYLINDER in direction INTO the box (i.e. -faceN)
+            float3 cylDeep = SupportPointCylinder(in cyl, cylAxis, -faceN);
+
+            // Project that deepest cylinder point onto the box face plane for a stable "on-box" contact.
+            // (If you want the point ON the cylinder instead, just return cylDeep.)
+            float signed = math.dot(faceN, cylDeep - faceCenter);
+            float3 onPlane = cylDeep - faceN * signed;
+
+            // For your "hard separation", you usually want the contact point on the box.
+            // This is guaranteed to correspond to the deepest cylinder penetration direction.
+            return onPlane;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 SupportPointCylinder(in Cylinder cyl, float3 cylAxis, float3 dirW)
+        {
+            // Normalize direction for stability
+            float3 dW = math.normalizesafe(dirW, new float3(0f, 1f, 0f));
+
+            // Convert dir to cylinder local (local axis is +Y)
+            quaternion inv = math.inverse(cyl.rot);
+            float3 dL = math.rotate(inv, dW);
+
+            // Choose cap by sign of Y
+            float y = (dL.y >= 0f) ? cyl.halfHeight : -cyl.halfHeight;
+
+            // Choose radial direction in XZ
+            float2 xz = new float2(dL.x, dL.z);
+            float lenSq = math.dot(xz, xz);
+
+            float3 pL;
+            if (lenSq > 1e-12f)
+            {
+                float invLen = math.rsqrt(lenSq);
+                float2 n = xz * invLen;
+                pL = new float3(n.x * cyl.radius, y, n.y * cyl.radius);
+            }
+            else
+            {
+                // Pure axis direction -> cap center
+                pL = new float3(0f, y, 0f);
+            }
+
+            return cyl.center + math.rotate(cyl.rot, pL);
         }
 
         // --- Cap-on-face: rim points on the box face ---
         private static bool BuildCapOnFaceRimManifold(
-            in Box box, in Cylinder cyl,
-            in BoxAxis boxAx, float3 cylAxis,
-            int boxFaceAxisIndex, // 0..2
-            float3 globalN,       // box -> cyl
-            float globalDepth,
-            out CylinderBoxContactPoints cbcp)
+    in Box box, in Cylinder cyl,
+    in BoxAxis boxAx, float3 cylAxis,
+    int boxFaceAxisIndex, // 0..2
+    float3 faceN,         // oriented box face normal (box -> cyl)
+    float globalDepth,
+    out CylinderBoxContactPoints cbcp)
         {
             cbcp = default;
-
-            // Determine which box face (positive/negative) is the reference face along globalN
-            float3 faceN = boxAx[boxFaceAxisIndex];
-            bool positiveFace = math.dot(faceN, globalN) > 0f;
-            if (!positiveFace) faceN = -faceN;
 
             float faceHalfN = GetHalf(box.halfExtents, boxFaceAxisIndex);
             float3 faceCenter = box.center + faceN * faceHalfN;
 
-            // Face basis (u,v) in-plane
             int uI = (boxFaceAxisIndex + 1) % 3;
             int vI = (boxFaceAxisIndex + 2) % 3;
             float3 u = boxAx[uI];
@@ -352,34 +411,46 @@ namespace Shard.Dev
             float uHalf = GetHalf(box.halfExtents, uI);
             float vHalf = GetHalf(box.halfExtents, vI);
 
-            // Choose the cylinder cap that faces toward the box (i.e., along -globalN)
-            // If cylAxis points roughly along globalN, the "bottom" cap (center - cylAxis*hh) faces box.
-            float s = math.dot(cylAxis, globalN);
+            // Choose the cap that faces toward the box (along -faceN)
+            float s = math.dot(cylAxis, faceN);
             float3 capCenter = (s > 0f)
                 ? (cyl.center - cylAxis * cyl.halfHeight)
                 : (cyl.center + cylAxis * cyl.halfHeight);
 
-            // Project cap center onto the face plane along face normal direction for stability
+            // Project cap center onto the box face plane (disk center in that plane)
             float signedDist = math.dot(faceN, capCenter - faceCenter);
             float3 capProjOnPlane = capCenter - faceN * signedDist;
 
-            // Candidate rim offsets (4-point)
-            float r = cyl.radius;
-            Span<float3> pts = stackalloc float3[4];
-            pts[0] = capProjOnPlane + u * r;
-            pts[1] = capProjOnPlane - u * r;
-            pts[2] = capProjOnPlane + v * r;
-            pts[3] = capProjOnPlane - v * r;
+            // Overlap guard: projected disk must overlap face rect (cheap reject)
+            float2 c2 = new float2(
+                math.dot(capProjOnPlane - faceCenter, u),
+                math.dot(capProjOnPlane - faceCenter, v));
 
-            // Clamp each point into the face rectangle (and keep on the plane)
+            float2 q = new float2(
+                math.max(math.abs(c2.x) - uHalf, 0f),
+                math.max(math.abs(c2.y) - vHalf, 0f));
+
+            float rGuard = cyl.radius + 1e-4f;
+            if (math.dot(q, q) > rGuard * rGuard)
+                return false;
+
+            // 4 candidates: +/-u, +/-v from projected center (then clamp into rect)
+            Span<float3> pts = stackalloc float3[4];
+            pts[0] = capProjOnPlane + u * cyl.radius;
+            pts[1] = capProjOnPlane - u * cyl.radius;
+            pts[2] = capProjOnPlane + v * cyl.radius;
+            pts[3] = capProjOnPlane - v * cyl.radius;
+
             int outCount = 0;
             Span<float3> outPts = stackalloc float3[4];
+
+            const float eps = 1e-4f;
 
             for (int i = 0; i < 4; i++)
             {
                 float3 p = pts[i];
 
-                // express in face basis
+                // Clamp to rectangle on the box face plane
                 float du = math.dot(p - faceCenter, u);
                 float dv = math.dot(p - faceCenter, v);
 
@@ -388,28 +459,48 @@ namespace Shard.Dev
 
                 float3 pClamped = faceCenter + u * du + v * dv;
 
-                // Ensure point is on/behind the plane slightly (contact slop)
+                // Must be on/behind the face plane slightly
                 float planeSigned = math.dot(faceN, pClamped - faceCenter);
-                if (planeSigned <= kContactSlop)
-                {
-                    // De-dupe very close points
-                    if (!IsNearExisting(outPts, outCount, pClamped, 1e-6f))
-                        outPts[outCount++] = pClamped;
-                }
+                if (planeSigned > kContactSlop)
+                    continue;
+
+                // *** THE IMPORTANT FIX ***
+                // Must lie inside the ACTUAL cylinder volume (in cylinder local space),
+                // not just inside some projected disk on the box plane.
+                if (!PointInsideCylinderWorld(in cyl, pClamped, eps))
+                    continue;
+
+                if (!IsNearExisting(outPts, outCount, pClamped, 1e-6f))
+                    outPts[outCount++] = pClamped;
             }
 
             if (outCount == 0)
                 return false;
 
-            // Write contacts with GLOBAL normal. Depth = plane penetration (debug-ish).
-            // Since you use global separation, you can just set depths to globalDepth for simplicity.
-            WriteContact(ref cbcp.p1, outPts[0], globalN, globalDepth);
-            if (outCount > 1) WriteContact(ref cbcp.p2, outPts[1], globalN, globalDepth);
-            if (outCount > 2) WriteContact(ref cbcp.p3, outPts[2], globalN, globalDepth);
-            if (outCount > 3) WriteContact(ref cbcp.p4, outPts[3], globalN, globalDepth);
+            WriteContact(ref cbcp.p1, outPts[0], faceN, globalDepth);
+            if (outCount > 1) WriteContact(ref cbcp.p2, outPts[1], faceN, globalDepth);
+            if (outCount > 2) WriteContact(ref cbcp.p3, outPts[2], faceN, globalDepth);
+            if (outCount > 3) WriteContact(ref cbcp.p4, outPts[3], faceN, globalDepth);
             cbcp.numContactPoints = outCount;
 
             return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool PointInsideCylinderWorld(in Cylinder cyl, float3 pWorld, float eps)
+        {
+            // Transform point into cylinder local space:
+            // cylinder local axis is +Y, with caps at +/-halfHeight.
+            float3 p = math.rotate(math.inverse(cyl.rot), pWorld - cyl.center);
+
+            // Height check
+            if (math.abs(p.y) > cyl.halfHeight + eps)
+                return false;
+
+            // Radial check in XZ
+            float rr = p.x * p.x + p.z * p.z;
+            float r2 = (cyl.radius + eps) * (cyl.radius + eps);
+            return rr <= r2;
         }
 
         // --- Generic robust manifold from closest segment↔OBB features (1–2 points) ---
@@ -427,86 +518,151 @@ namespace Shard.Dev
             // Cylinder axis segment endpoints
             GetCylinderSegment(in cyl, cylAxis, out float3 A, out float3 B);
 
-            // Closest axis point to the OBB (world)
+            // Closest axis point to the OBB (world) + closest point on box (world)
             ClosestSegmentOBB(in box, in boxAx, A, B, out float3 segPtW, out float3 boxPtW, out float distSq);
 
             float3 n = globalN;
 
-            // Prefer contact points ON the BOX for debug/readability (change to midpoint/cyl surface if you prefer)
-            WriteContact(ref cbcp.p1, boxPtW, n, globalDepth);
+            // --- IMPORTANT: classify the closest box feature ---
+            // If the closest point on the OBB lies on an EDGE or VERTEX, do NOT attempt a 2-point band.
+            // Those cases are exactly where your "two points projected onto the cube" becomes nonsense.
+            float3 boxPtL = ToBoxLocal(in box, in boxAx, boxPtW);
+            bool boxFeatureIsFace = IsLocalPointOnFaceOnly(boxPtL, box.halfExtents, 1e-5f, out int faceAxis);
+
+            // --- Create a robust single contact point ---
+            // boxPtW is inside/on the box. Project it to the cylinder to get a cylinder witness point.
+            float3 cylPtW = ClosestPointOnCylinderToPointWorld(in cyl, boxPtW);
+
+            // With a single contact point slot (no separate points-per-body),
+            // the safest "contained-ish" point is the midpoint of witnesses.
+            // This dramatically reduces "point is on cube face but outside cylinder" artifacts.
+            float3 contactW = 0.5f * (boxPtW + cylPtW);
+
+            WriteContact(ref cbcp.p1, contactW, n, globalDepth);
             cbcp.numContactPoints = 1;
 
-            // If this is a side-ish contact (not cap-on-face), try to generate 2 stable points along the cylinder axis "contact band".
+            // If not a face contact, we are done. (Edge/vertex -> one point only.)
+            if (!boxFeatureIsFace)
+                return;
+
+            // If this is cap-like (normal ~ cylinder axis), you also generally want 1 point unless
+            // you're doing a dedicated cap clipping routine. Your cap path is separate already.
+            const float kCapParallel = 0.999f;
             float align = math.abs(math.dot(cylAxis, n));
-            if (align < 0.9f)
+            if (align >= kCapParallel)
+                return;
+
+            // --- Face contact candidate: now we can TRY a 2-point band ---
+            // But we must produce points that correspond to the cylinder, not just "closest on box".
+            float t0 = math.dot(segPtW - cyl.center, cylAxis);
+            t0 = math.clamp(t0, -cyl.halfHeight, cyl.halfHeight);
+
+            const float bandSlop = 1e-4f;
+            float r = cyl.radius + bandSlop;
+
+            if (!FindAxisContactBand(in box, in boxAx, in cyl, cylAxis, t0, r, out float tL, out float tR))
+                return;
+
+            // If the band is tiny, it's effectively a single-point contact (common near edges)
+            if (math.abs(tR - tL) <= 1e-3f)
+                return;
+
+            // Build two contacts at band ends, but each contact must be "witnessed" against cylinder too.
+            float3 P1 = cyl.center + cylAxis * tL;
+            float3 Q1 = ClosestPointOnOBB(in box, in boxAx, P1);
+            float3 S1 = ClosestPointOnCylinderToPointWorld(in cyl, Q1);
+            float3 C1 = 0.5f * (Q1 + S1);
+
+            float3 P2 = cyl.center + cylAxis * tR;
+            float3 Q2 = ClosestPointOnOBB(in box, in boxAx, P2);
+            float3 S2 = ClosestPointOnCylinderToPointWorld(in cyl, Q2);
+            float3 C2 = 0.5f * (Q2 + S2);
+
+            // Reject degenerate / duplicate points
+            if (math.lengthsq(C1 - cbcp.p1.point) <= 1e-6f && math.lengthsq(C2 - cbcp.p1.point) <= 1e-6f)
+                return;
+
+            // Pick the second point as the one farther from the first (more stable)
+            float d1 = math.lengthsq(C1 - cbcp.p1.point);
+            float d2 = math.lengthsq(C2 - cbcp.p1.point);
+            float3 pick = (d2 > d1) ? C2 : C1;
+
+            if (math.lengthsq(pick - cbcp.p1.point) > 1e-6f)
             {
-                // t parameter of closest axis point relative to cylinder center (in [-halfHeight, +halfHeight])
-                float t0 = math.dot(segPtW - cyl.center, cylAxis);
-                t0 = math.clamp(t0, -cyl.halfHeight, cyl.halfHeight);
-
-                // Find interval [tL, tR] where distance(axisPoint(t), OBB) <= radius (+slop)
-                const float bandSlop = 1e-4f;
-                float r = cyl.radius + bandSlop;
-
-                if (FindAxisContactBand(in box, in boxAx, in cyl, cylAxis, t0, r, out float tL, out float tR))
-                {
-                    // If the band has meaningful length, use its ends as two contacts
-                    if (math.abs(tR - tL) > 1e-3f)
-                    {
-                        float3 P1 = cyl.center + cylAxis * tL;
-                        float3 Q1 = ClosestPointOnOBB(in box, in boxAx, P1);
-
-                        float3 P2 = cyl.center + cylAxis * tR;
-                        float3 Q2 = ClosestPointOnOBB(in box, in boxAx, P2);
-
-                        // De-dupe vs first point and each other
-                        if (math.lengthsq(Q1 - cbcp.p1.point) > 1e-6f)
-                        {
-                            WriteContact(ref cbcp.p2, Q1, n, globalDepth);
-                            cbcp.numContactPoints = 2;
-                        }
-
-                        // If Q1 got added as p2, try to use Q2 as a third? You only have 4 slots,
-                        // but if you want strictly "2 points", then choose the two most separated.
-                        // Here we enforce exactly 2 points: p1 is closest, p2 becomes the farther end.
-                        if (cbcp.numContactPoints == 1)
-                        {
-                            // p1 was boxPtW. Choose the farther of Q1/Q2 from p1.
-                            float d1 = math.lengthsq(Q1 - cbcp.p1.point);
-                            float d2 = math.lengthsq(Q2 - cbcp.p1.point);
-                            float3 pick = (d2 > d1) ? Q2 : Q1;
-
-                            if (math.lengthsq(pick - cbcp.p1.point) > 1e-6f)
-                            {
-                                WriteContact(ref cbcp.p2, pick, n, globalDepth);
-                                cbcp.numContactPoints = 2;
-                            }
-                        }
-                        else
-                        {
-                            // p2 is Q1 right now; see if Q2 is actually farther and replace p2 if so.
-                            float dCur = math.lengthsq(cbcp.p2.point - cbcp.p1.point);
-                            float dAlt = math.lengthsq(Q2 - cbcp.p1.point);
-                            if (dAlt > dCur && math.lengthsq(Q2 - cbcp.p1.point) > 1e-6f)
-                            {
-                                WriteContact(ref cbcp.p2, Q2, n, globalDepth);
-                            }
-                        }
-
-                        return; // side manifold done
-                    }
-                }
+                WriteContact(ref cbcp.p2, pick, n, globalDepth);
+                cbcp.numContactPoints = 2;
             }
 
-            // Fallback: single point only (your original behavior), but with box-point placement
-            // If you want, you can keep your old "probe" as a last resort, but the band search usually removes the need.
+            // Final safety: if the chosen second point ends up basically coincident, keep 1.
+            if (cbcp.numContactPoints == 2 && math.lengthsq(cbcp.p2.point - cbcp.p1.point) <= 1e-6f)
+                cbcp.numContactPoints = 1;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 ClosestPointOnCylinderToPointWorld(in Cylinder cyl, float3 pWorld)
+        {
+            // Cylinder local axis is +Y. Convert point to cylinder local space.
+            float3 pL = math.rotate(math.inverse(cyl.rot), pWorld - cyl.center);
+
+            // Clamp height into [-hh, +hh]
+            float y = math.clamp(pL.y, -cyl.halfHeight, cyl.halfHeight);
+
+            // Radial clamp in XZ
+            float2 xz = new float2(pL.x, pL.z);
+            float lenSq = math.lengthsq(xz);
+            float r = cyl.radius;
+
+            float2 xzClamped;
+            if (lenSq <= 1e-12f)
+            {
+                // On axis: choose any point on radius (doesn't matter much for overlap case)
+                xzClamped = new float2(r, 0f);
+            }
+            else
+            {
+                float len = math.sqrt(lenSq);
+                float s = math.min(1f, r / len);
+                xzClamped = xz * s;
+            }
+
+            float3 qL = new float3(xzClamped.x, y, xzClamped.y);
+            return cyl.center + math.rotate(cyl.rot, qL);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsLocalPointOnFaceOnly(float3 pL, float3 half, float eps, out int faceAxis)
+        {
+            faceAxis = -1;
+
+            int onCount = 0;
+            int axis = -1;
+
+            float dx = math.abs(math.abs(pL.x) - half.x);
+            float dy = math.abs(math.abs(pL.y) - half.y);
+            float dz = math.abs(math.abs(pL.z) - half.z);
+
+            if (dx <= eps) { onCount++; axis = 0; }
+            if (dy <= eps) { onCount++; axis = 1; }
+            if (dz <= eps) { onCount++; axis = 2; }
+
+            if (onCount == 1)
+            {
+                faceAxis = axis;
+                return true;
+            }
+
+            // onCount 0 => interior (shouldn't happen for ClosestPointOnOBB unless box is degenerate)
+            // onCount 2 => edge
+            // onCount 3 => vertex
+            return false;
+        }
+
+
         private static bool FindAxisContactBand(
-    in Box box, in BoxAxis boxAx,
-    in Cylinder cyl, float3 cylAxis,
-    float t0, float r,
-    out float tL, out float tR)
+            in Box box, in BoxAxis boxAx,
+            in Cylinder cyl, float3 cylAxis,
+            float t0, float r,
+            out float tL, out float tR)
         {
             float r2 = r * r;
             float tMin = -cyl.halfHeight;
