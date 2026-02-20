@@ -398,6 +398,8 @@ namespace Shard.Dev
         }
 
         // --- Generic robust manifold from closest segment↔OBB features (1–2 points) ---
+        // --- Generic robust manifold from closest segment↔OBB features (1–2 points) ---
+        // --- Generic robust manifold from closest segment↔OBB features (1–2 points) ---
         private static void BuildClosestFeatureManifold(
             in Box box, in Cylinder cyl,
             in BoxAxis boxAx, float3 cylAxis,
@@ -407,51 +409,246 @@ namespace Shard.Dev
         {
             cbcp = default;
 
-            // Build cylinder segment in world
+            // Cylinder axis segment endpoints
             GetCylinderSegment(in cyl, cylAxis, out float3 A, out float3 B);
 
-            // Compute closest points between segment and OBB (via box-local AABB and edge checks)
+            // Closest axis point to the OBB (world)
             ClosestSegmentOBB(in box, in boxAx, A, B, out float3 segPtW, out float3 boxPtW, out float distSq);
 
-            float dist = math.sqrt(math.max(distSq, 0f));
-            float depth = cyl.radius - dist;
+            float3 n = globalN;
 
-            // If for some numerical reason dist > r but SAT said overlap, clamp to small.
-            if (depth < 0f) depth = 0f;
-
-            // Contact point on cylinder surface (approx) and box point (feature)
-            float3 n = globalN; // force consistency with your solver
-            float3 pCyl = segPtW + n * cyl.radius;
-            float3 cp = (pCyl + boxPtW) * 0.5f;
-
-            WriteContact(ref cbcp.p1, cp, n, globalDepth);
+            // Prefer contact points ON the BOX for debug/readability (change to midpoint/cyl surface if you prefer)
+            WriteContact(ref cbcp.p1, boxPtW, n, globalDepth);
             cbcp.numContactPoints = 1;
 
-            // Optional: add a second contact along the cylinder axis (helps rolling stability)
-            // Only if cylinder is not cap-aligned to normal (side-ish contact).
+            // If this is a side-ish contact (not cap-on-face), try to generate 2 stable points along the cylinder axis "contact band".
             float align = math.abs(math.dot(cylAxis, n));
             if (align < 0.9f)
             {
-                // step a bit along axis (clamp to segment)
-                float step = math.min(cyl.halfHeight * 0.5f, math.max(0.01f, cyl.radius * 0.5f));
-                float3 A2 = A + cylAxis * step;
-                float3 B2 = B - cylAxis * step;
+                // t parameter of closest axis point relative to cylinder center (in [-halfHeight, +halfHeight])
+                float t0 = math.dot(segPtW - cyl.center, cylAxis);
+                t0 = math.clamp(t0, -cyl.halfHeight, cyl.halfHeight);
 
-                // pick the nearer of these endpoints to the box as second probe
-                float3 probe = (math.lengthsq(A2 - boxPtW) < math.lengthsq(B2 - boxPtW)) ? A2 : B2;
+                // Find interval [tL, tR] where distance(axisPoint(t), OBB) <= radius (+slop)
+                const float bandSlop = 1e-4f;
+                float r = cyl.radius + bandSlop;
 
-                // closest point on box to probe
-                float3 probeBox = ClosestPointOnOBB(in box, in boxAx, probe);
-                float3 probeCp = (probe + n * cyl.radius + probeBox) * 0.5f;
-
-                // avoid duplicates
-                if (math.lengthsq(probeCp - cbcp.p1.point) > 1e-6f)
+                if (FindAxisContactBand(in box, in boxAx, in cyl, cylAxis, t0, r, out float tL, out float tR))
                 {
-                    WriteContact(ref cbcp.p2, probeCp, n, globalDepth);
-                    cbcp.numContactPoints = 2;
+                    // If the band has meaningful length, use its ends as two contacts
+                    if (math.abs(tR - tL) > 1e-3f)
+                    {
+                        float3 P1 = cyl.center + cylAxis * tL;
+                        float3 Q1 = ClosestPointOnOBB(in box, in boxAx, P1);
+
+                        float3 P2 = cyl.center + cylAxis * tR;
+                        float3 Q2 = ClosestPointOnOBB(in box, in boxAx, P2);
+
+                        // De-dupe vs first point and each other
+                        if (math.lengthsq(Q1 - cbcp.p1.point) > 1e-6f)
+                        {
+                            WriteContact(ref cbcp.p2, Q1, n, globalDepth);
+                            cbcp.numContactPoints = 2;
+                        }
+
+                        // If Q1 got added as p2, try to use Q2 as a third? You only have 4 slots,
+                        // but if you want strictly "2 points", then choose the two most separated.
+                        // Here we enforce exactly 2 points: p1 is closest, p2 becomes the farther end.
+                        if (cbcp.numContactPoints == 1)
+                        {
+                            // p1 was boxPtW. Choose the farther of Q1/Q2 from p1.
+                            float d1 = math.lengthsq(Q1 - cbcp.p1.point);
+                            float d2 = math.lengthsq(Q2 - cbcp.p1.point);
+                            float3 pick = (d2 > d1) ? Q2 : Q1;
+
+                            if (math.lengthsq(pick - cbcp.p1.point) > 1e-6f)
+                            {
+                                WriteContact(ref cbcp.p2, pick, n, globalDepth);
+                                cbcp.numContactPoints = 2;
+                            }
+                        }
+                        else
+                        {
+                            // p2 is Q1 right now; see if Q2 is actually farther and replace p2 if so.
+                            float dCur = math.lengthsq(cbcp.p2.point - cbcp.p1.point);
+                            float dAlt = math.lengthsq(Q2 - cbcp.p1.point);
+                            if (dAlt > dCur && math.lengthsq(Q2 - cbcp.p1.point) > 1e-6f)
+                            {
+                                WriteContact(ref cbcp.p2, Q2, n, globalDepth);
+                            }
+                        }
+
+                        return; // side manifold done
+                    }
                 }
             }
+
+            // Fallback: single point only (your original behavior), but with box-point placement
+            // If you want, you can keep your old "probe" as a last resort, but the band search usually removes the need.
         }
+
+        private static bool FindAxisContactBand(
+    in Box box, in BoxAxis boxAx,
+    in Cylinder cyl, float3 cylAxis,
+    float t0, float r,
+    out float tL, out float tR)
+        {
+            float r2 = r * r;
+            float tMin = -cyl.halfHeight;
+            float tMax = cyl.halfHeight;
+
+            // Quick check: if even at t0 we're not within radius, no band (numerical oddity)
+            if (DistSqPointOBB(cyl.center + cylAxis * t0, in box, in boxAx) > r2)
+            {
+                tL = tR = t0;
+                return false;
+            }
+
+            // Search outward to bracket the boundary on each side
+            float step = math.min(math.max(cyl.radius * 0.5f, 0.01f), cyl.halfHeight); // sane step
+
+            tL = t0;
+            tR = t0;
+
+            // Left side (toward tMin)
+            {
+                float tIn = t0;
+                float tOut = t0;
+
+                // march until we leave the radius zone or hit bound
+                while (true)
+                {
+                    float next = tOut - step;
+                    if (next <= tMin) { tOut = tMin; break; }
+
+                    float d2 = DistSqPointOBB(cyl.center + cylAxis * next, in box, in boxAx);
+                    if (d2 > r2) { break; }
+
+                    tOut = next;
+                }
+
+                // If we hit tMin and still inside, boundary is at tMin
+                if (tOut == tMin && DistSqPointOBB(cyl.center + cylAxis * tMin, in box, in boxAx) <= r2)
+                {
+                    tL = tMin;
+                }
+                else
+                {
+                    // We have bracket [tOut, tIn] where tIn is inside and tOut is outside-ish.
+                    // Ensure proper bracket
+                    float inside = tIn;
+                    float outside = tOut - step; // the first outside candidate
+                    outside = math.max(outside, tMin);
+
+                    // If outside isn't actually outside (step too big), just use inside
+                    if (DistSqPointOBB(cyl.center + cylAxis * outside, in box, in boxAx) <= r2)
+                        tL = inside;
+                    else
+                        tL = BisectionToBoundary(in box, in boxAx, cyl, cylAxis, inside, outside, r2);
+                }
+            }
+
+            // Right side (toward tMax)
+            {
+                float tIn = t0;
+                float tOut = t0;
+
+                while (true)
+                {
+                    float next = tOut + step;
+                    if (next >= tMax) { tOut = tMax; break; }
+
+                    float d2 = DistSqPointOBB(cyl.center + cylAxis * next, in box, in boxAx);
+                    if (d2 > r2) { break; }
+
+                    tOut = next;
+                }
+
+                if (tOut == tMax && DistSqPointOBB(cyl.center + cylAxis * tMax, in box, in boxAx) <= r2)
+                {
+                    tR = tMax;
+                }
+                else
+                {
+                    float inside = tIn;
+                    float outside = tOut + step;
+                    outside = math.min(outside, tMax);
+
+                    if (DistSqPointOBB(cyl.center + cylAxis * outside, in box, in boxAx) <= r2)
+                        tR = inside;
+                    else
+                        tR = BisectionToBoundary(in box, in boxAx, cyl, cylAxis, inside, outside, r2);
+                }
+            }
+
+            // Make sure ordering
+            if (tL > tR) { float tmp = tL; tL = tR; tR = tmp; }
+
+            return true;
+        }
+
+        private static float BisectionToBoundary(
+            in Box box, in BoxAxis boxAx,
+            in Cylinder cyl, float3 cylAxis,
+            float tInside, float tOutside, float r2)
+        {
+            // We expect DistSq(tInside) <= r2, DistSq(tOutside) > r2
+            float a = tInside;
+            float b = tOutside;
+
+            // 8 iterations is plenty
+            for (int i = 0; i < 8; i++)
+            {
+                float m = 0.5f * (a + b);
+                float d2 = DistSqPointOBB(cyl.center + cylAxis * m, in box, in boxAx);
+                if (d2 <= r2) a = m;
+                else b = m;
+            }
+
+            return a; // last inside point near boundary
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float DistSqPointOBB(float3 p, in Box box, in BoxAxis ax)
+        {
+            float3 q = ClosestPointOnOBB(in box, in ax, p);
+            return math.lengthsq(p - q);
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 ComputeCylinderRadialTowardBox(float3 segPtW, float3 boxPtW, float3 cylAxis, float3 fallbackN)
+        {
+            // Radial direction = (box - axisPoint) with axis component removed
+            float3 d = boxPtW - segPtW;
+            d -= cylAxis * math.dot(d, cylAxis);
+
+            float lenSq = math.lengthsq(d);
+            if (lenSq <= 1e-12f)
+            {
+                // Degenerate: box point is (nearly) on the cylinder axis line.
+                // Pick any perpendicular to cylAxis, biased by fallbackN if possible.
+                float3 perp = fallbackN - cylAxis * math.dot(fallbackN, cylAxis);
+                if (math.lengthsq(perp) <= 1e-12f)
+                    perp = AnyPerp(cylAxis);
+                return math.normalize(perp);
+            }
+
+            return d * math.rsqrt(lenSq);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 AnyPerp(float3 n)
+        {
+            // Return any unit vector perpendicular to n (n assumed unit-ish)
+            float3 a = (math.abs(n.y) < 0.999f) ? math.up() : math.right();
+            float3 p = math.cross(n, a);
+            float lenSq = math.lengthsq(p);
+            if (lenSq <= 1e-12f)
+                return new float3(1, 0, 0);
+            return p * math.rsqrt(lenSq);
+        }
+
 
         // ------------------------------------------------------------
         // Geometry helpers
