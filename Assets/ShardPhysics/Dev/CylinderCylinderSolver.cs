@@ -432,13 +432,13 @@ namespace Shard.Dev
             int count = 0;
 
             ContactPoint cp0;
-            cp0.point = wSide0;     // ON SIDE
+            cp0.point = 0.5f * (c0 + wSide0);     // ON SIDE
             cp0.normal = nAB;        // pen axis
             cp0.depth = satDepth;   // pen depth along pen axis (uniform)
             Write(ref cc, count++, cp0);
 
             ContactPoint cp1;
-            cp1.point = wSide1;     // ON SIDE
+            cp1.point = 0.5f * (c1 + wSide1);     // ON SIDE
             cp1.normal = nAB;
             cp1.depth = satDepth;
             Write(ref cc, count++, cp1);
