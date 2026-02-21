@@ -689,15 +689,38 @@ namespace Shard.Runtime
             }
 
             // ---------- Cylinder - Box (A = Cylinder) ----------
-            else if (TryGetBodyCylinder(a, out float cylHH2, out float cylR2, out ShardColliderMaterial matCyl2) &&
-                     TryGetBodyBox(b, out float3 boxHalf2, out ShardColliderMaterial matBox2))
+            else if (TryGetBodyCylinder(a, out cylHH, out cylR, out matCyl) &&
+                     TryGetBodyBox(b, out boxHalf, out matBox))
             {
-                CombineMaterials(matCyl2, matBox2, out restitution, out muS, out muD, out muR);
+                CombineMaterials(matCyl, matBox, out restitution, out muS, out muD, out muR);
 
-                var box = new CylinderBoxSolver.Box(pb.position, pb.rotation, boxHalf2);
-                var cyl = new CylinderBoxSolver.Cylinder(pa.position, pa.rotation, cylHH2, cylR2);
+                var box = new CylinderBoxSolver.Box(pb.position, pb.rotation, boxHalf);
+                var cyl = new CylinderBoxSolver.Cylinder(pa.position, pa.rotation, cylHH, cylR);
 
                 if (!CylinderBoxSolver.Solve(box, cyl, out cps))
+                {
+                    return false;
+                }
+
+                // flip manifold (solver gives box->cyl, we need A->B)
+                cps.globalPenAxis = -cps.globalPenAxis;
+
+                for (int i = 0; i < cps.numContactPoints; i++)
+                    cps[i] = new ContactPoint { point = cps[i].point, normal = -cps[i].normal, depth = cps[i].depth };
+
+                return true;
+            }
+
+            // ---------- Cylinder - Cylinder ----------
+            else if (TryGetBodyCylinder(a, out cylHH, out cylR, out matCyl) &&
+                     TryGetBodyCylinder(b, out var cylHH2, out var cylR2, out var matCyl2))
+            {
+                CombineMaterials(matCyl, matCyl2, out restitution, out muS, out muD, out muR);
+
+                var cyl1 = new CylinderCylinderSolver.Cylinder(pa.position, pa.rotation, cylHH, cylR);
+                var cyl2 = new CylinderCylinderSolver.Cylinder(pb.position, pb.rotation, cylHH2, cylR2);
+
+                if (!CylinderCylinderSolver.Solve(cyl1, cyl2, out cps))
                 {
                     return false;
                 }

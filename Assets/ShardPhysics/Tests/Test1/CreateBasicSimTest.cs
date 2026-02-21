@@ -14,9 +14,10 @@ namespace Shard.Tests.Test1
         [SerializeField] Transform box1Trans;
         [SerializeField] Transform box2Trans;
         [SerializeField] Transform cyl1Trans;
+        [SerializeField] Transform cyl2Trans;
 
         ShardPhysicsWorld world;
-        ShardBodyHandle box1, box2, cylinder1;
+        ShardBodyHandle box1, box2, cylinder1, cylinder2;
 
         private void Awake()
         {
@@ -79,6 +80,24 @@ namespace Shard.Tests.Test1
             });
             cylinder1 = world.CreateBody(new Runtime.Pose { position = cyl1Trans.position, rotation = cyl1Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray());
 
+            colliders.Clear();
+            colliders.Add(new ShardCollider
+            {
+                localPose = new Runtime.Pose { position = float3.zero, rotation = quaternion.identity },
+                type = ShardColliderType.Cylinder,
+                height = 1.0f,
+                radius = 0.5f,
+                density = 1.0f,
+                //material = new ShardColliderMaterial
+                //{
+                //    bounciness = 0.2f,
+                //    frictionDynamic = 1.0f,
+                //    frictionStatic = 0.5f,
+                //    frictionRolling = 0.2f
+                //}
+            });
+            cylinder2 = world.CreateBody(new Runtime.Pose { position = cyl2Trans.position, rotation = cyl2Trans.rotation }, BodyType.Dynamic, 1, colliders.AsArray());
+
             StartCoroutine(Tick());
         }
 
@@ -126,38 +145,28 @@ namespace Shard.Tests.Test1
                 //}
                 //print(hit);
 
-                if (world.TryGetPose(box1, out var pose))
-                {
-                    box1Trans.position = pose.position;
-                    box1Trans.rotation = pose.rotation;
-                    box1Trans.gameObject.SetActive(true);
-                }
-                else
-                {
-                    box1Trans.gameObject.SetActive(false);
-                }
+                UpdatePose(box1, box1Trans);
 
-                if (world.TryGetPose(box2, out pose))
-                {
-                    box2Trans.position = pose.position;
-                    box2Trans.rotation = pose.rotation;
-                    box2Trans.gameObject.SetActive(true);
-                }
-                else
-                {
-                    box2Trans.gameObject.SetActive(false);
-                }
+                UpdatePose(box2, box2Trans);
 
-                if (world.TryGetPose(cylinder1, out pose))
-                {
-                    cyl1Trans.position = pose.position;
-                    cyl1Trans.rotation = pose.rotation;
-                    cyl1Trans.gameObject.SetActive(true);
-                }
-                else
-                {
-                    cyl1Trans.gameObject.SetActive(false);
-                }
+
+                UpdatePose(cylinder1, cyl1Trans);
+                UpdatePose(cylinder2, cyl2Trans);
+
+            }
+        }
+
+        void UpdatePose(ShardBodyHandle body, Transform trans)
+        {
+            if (world.TryGetPose(body, out var pose))
+            {
+                trans.position = pose.position;
+                trans.rotation = pose.rotation;
+                trans.gameObject.SetActive(true);
+            }
+            else
+            {
+                trans.gameObject.SetActive(false);
             }
         }
     }
