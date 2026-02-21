@@ -57,6 +57,9 @@ namespace Shard.Dev
         private const float kAxisEps = 1e-10f;
         private const float kDedupEpsSq = 1e-10f;
 
+        private const float kCapSideParallelEps = 0.02f; // keep your existing
+        private const float kTiny = 1e-12f;
+
         // ============================================================
         // Public API (UNCHANGED)
         // ============================================================
@@ -69,37 +72,34 @@ namespace Shard.Dev
             float3 aAxis = GetAxis(in a);
             float3 bAxis = GetAxis(in b);
 
-            // SAT gives reliable overlap test + an MTV over the candidate set.
-            // SAT gives reliable overlap test + an MTV over the candidate set.
+            // SAT overlap + MTV
             if (!SAT_CylinderCylinder(in a, in b, aAxis, bAxis, out float3 n, out float depth))
                 return false;
-
-            // Orient A->B
 
             if (depth <= kSlop)
                 return false;
 
-            cc.globalPenAxis = n;
-            cc.globalPenDepth = depth;
-
-            // Orient A->B early (important for choosing facing caps)
+            // Orient MTV A->B (must be done BEFORE any classification/manifold)
             float3 cTo = b.center - a.center;
             if (math.dot(n, cTo) < 0f) n = -n;
+
+            cc.globalPenAxis = n;
+            cc.globalPenDepth = depth;
 
             float axesDot = math.abs(math.dot(aAxis, bAxis));
             bool axesParallel = axesDot > 0.9995f;
 
-            // side normal means n mostly perpendicular to both axes
             bool sideNormal =
                 math.abs(math.dot(n, aAxis)) < 0.2f &&
                 math.abs(math.dot(n, bAxis)) < 0.2f;
 
-            // cap normal means n mostly aligned with both axes
             bool capNormal =
                 math.abs(math.dot(n, aAxis)) > 0.9f &&
                 math.abs(math.dot(n, bAxis)) > 0.9f;
 
-            // ✅ CAP-CAP PARALLEL: 4 points on the shared mid-plane, clipped to disk∩disk
+            // ---------------------------
+            // 1) PARALLEL CAP–CAP (keep your existing behavior)
+            // ---------------------------
             if (axesParallel && capNormal)
             {
                 if (BuildCapCapParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc))
@@ -111,6 +111,9 @@ namespace Shard.Dev
                 }
             }
 
+            // ---------------------------
+            // 2) PARALLEL SIDE–SIDE (keep your existing behavior)
+            // ---------------------------
             if (axesParallel && sideNormal)
             {
                 if (BuildSideSideParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc))
@@ -122,16 +125,188 @@ namespace Shard.Dev
                 }
             }
 
-            // Bepu-style: build manifold in contact plane via support probing + reduction.
+            // ---------------------------
+            // 3) CAP–SIDE EDGE @ ~90° (THIS MUST RUN BEFORE CONVEX FALLBACK)
+            // Emits EXACTLY 2 points (min/max bounds of intersecting edge)
+            // ---------------------------
+
+
+            // We want a forgiving "near 90°" test. (Adjust window if needed.)
+            bool axesPerp = axesDot < 0.05f;
+
+            if (axesPerp)
+            {
+                // Try A cap vs B side
+                if (TryBuildCapSideEdge(in a, in b, aAxis, bAxis, n, depth, ref cc))
+                {
+                    DedupAndCompact(ref cc);
+                    cc.globalPenAxis = n;
+                    cc.globalPenDepth = depth;
+                    return cc.numContactPoints > 0; // IMPORTANT: prevent 4-pt convex fallback
+                }
+
+                // Try B cap vs A side
+                if (TryBuildCapSideEdge(in b, in a, bAxis, aAxis, n, depth, ref cc))
+                {
+                    DedupAndCompact(ref cc);
+                    cc.globalPenAxis = n;
+                    cc.globalPenDepth = depth;
+                    return cc.numContactPoints > 0; // IMPORTANT: prevent 4-pt convex fallback
+                }
+            }
+
+            // ---------------------------
+            // 4) FALLBACK: generic convex-style reduction
+            // (This can emit up to 4 — by design.)
+            // ---------------------------
             BuildManifold_ConvexStyle(in a, in b, aAxis, bAxis, n, depth, ref cc);
 
             DedupAndCompact(ref cc);
-
-            // Guarantee metadata preserved
             cc.globalPenAxis = n;
             cc.globalPenDepth = depth;
-
             return cc.numContactPoints > 0;
+        }
+
+
+        private static bool TryBuildCapSideEdge(
+    in Cylinder capCyl, in Cylinder sideCyl,
+    float3 capAxis, float3 sideAxis,
+    float3 nAB, float satDepth,
+    ref CylinderCylinderContactPoints cc)
+        {
+            // near 90° gate (looser so we don't fall back)
+            if (math.abs(math.dot(sideAxis, capAxis)) > 0.10f)
+                return false;
+
+            // IMPORTANT:
+            // nCap must point CAP -> SIDE for cap selection + "deepest edge" direction.
+            float3 nCap = nAB;
+            float3 capToSide = sideCyl.center - capCyl.center;
+            if (math.dot(nCap, capToSide) < 0f)
+                nCap = -nCap;
+
+            // Pick facing cap using nCap (cap -> side), not global ordering.
+            float s = (math.dot(nCap, capAxis) >= 0f) ? +1f : -1f;
+
+            float3 capCenter = capCyl.center + capAxis * (s * capCyl.halfHeight);
+            float3 capNormalOut = capAxis * s; // outward normal of that cap face (points toward side)
+
+            // Build on deepest penetrating side edge (direction decided by capNormalOut)
+            return BuildCapSide_DeepestPenetratingEdge_TwoPoints(
+                in capCyl, capCenter, capNormalOut,
+                in sideCyl, sideAxis,
+                nAB, satDepth,   // keep GLOBAL normal for cp.normal / solver direction
+                ref cc);
+        }
+
+        private static bool BuildCapSide_DeepestPenetratingEdge_TwoPoints(
+    in Cylinder cap, float3 capCenter, float3 capNormalOut,
+    in Cylinder side, float3 sideAxis,
+    float3 nAB, float satDepth,
+    ref CylinderCylinderContactPoints cc)
+        {
+            // Preconditions:
+            // - dot(sideAxis, capNormalOut) ~ 0 (side axis lies in cap plane)
+            // - capCenter is chosen cap center
+            // - capNormalOut points OUT of the cap face
+
+            // Build in-plane basis for the cap plane:
+            // d = sideAxis projected into cap plane (should already be almost in plane)
+            float3 d = sideAxis - capNormalOut * math.dot(sideAxis, capNormalOut);
+            float dLenSq = math.lengthsq(d);
+            if (dLenSq < kTiny) return false;
+            d *= math.rsqrt(dLenSq);
+
+            // p = perpendicular in cap plane
+            float3 p = math.cross(capNormalOut, d);
+            float pLenSq = math.lengthsq(p);
+            if (pLenSq < kTiny) return false;
+            p *= math.rsqrt(pLenSq);
+
+            // Signed distance of side axis (through side.center) to the cap plane along capNormalOut:
+            float hOut = math.dot(side.center - capCenter, capNormalOut);
+
+            // The deepest penetrating edge of the side cylinder is the generatrix shifted
+            // into the cap by radius along -capNormalOut.
+            // Distance of that edge to the plane: distEdge = hOut - side.radius.
+            float distEdge = hOut - side.radius;
+
+            // If the deepest edge is not behind the cap plane, there is no cap penetration by that edge.
+            if (distEdge >= -1e-6f)
+                return false;
+
+            // Deepest penetration magnitude relative to the cap plane (along capNormalOut).
+            float penDeepPlane = -distEdge; // = side.radius - hOut
+
+            // Project side axis line onto the cap plane (a point on the side axis in the cap plane):
+            // axisOnPlane = side.center - capNormalOut * hOut
+            float3 axisOnPlane = side.center - capNormalOut * hOut;
+
+            // In cap-plane coordinates relative to capCenter:
+            float3 rel = axisOnPlane - capCenter;
+            float xAxis = math.dot(rel, p); // perpendicular-to-axis offset in plane
+            float yAxis = math.dot(rel, d); // along-axis offset in plane
+
+            float R = cap.radius;
+
+            // Intersect the projected axis line with the cap disk:
+            // Condition: xAxis^2 + (yAxis + t)^2 <= R^2  where t is along d (and equals sideAxis param)
+            float yMaxSq = R * R - xAxis * xAxis;
+            if (yMaxSq <= 1e-10f)
+                return false; // tangent / no segment => let fallback handle
+
+            float yMax = math.sqrt(yMaxSq);
+
+            // Solve |yAxis + t| <= yMax  =>  t in [-yAxis - yMax, -yAxis + yMax]
+            float tMinDisk = -yAxis - yMax;
+            float tMaxDisk = -yAxis + yMax;
+
+            // Clip by finite side height along sideAxis: t in [-hh, +hh]
+            float t0 = math.max(tMinDisk, -side.halfHeight);
+            float t1 = math.min(tMaxDisk, +side.halfHeight);
+
+            if (t1 < t0 + 1e-7f)
+                return false;
+
+            // Build the two deepest-edge points ON THE SIDE CYLINDER (penetrating feature):
+            float3 inward = -capNormalOut;
+            float3 wSide0 = side.center + sideAxis * t0 + inward * side.radius;
+            float3 wSide1 = side.center + sideAxis * t1 + inward * side.radius;
+
+            // Corresponding points on the CAP FACE (cap plane) are the projection of the side points
+            // along capNormalOut back to the plane by distEdge (constant):
+            // Since distEdge = dot(wSide - capCenter, capNormalOut), the plane witness is:
+            float3 wCap0 = wSide0 - capNormalOut * distEdge;
+            float3 wCap1 = wSide1 - capNormalOut * distEdge;
+
+            // Depth should be the deepest-edge penetration ALONG nAB (stable for solver push).
+            // Use witness difference along nAB (cap -> side), ensure positivity.
+            float depth0 = math.abs(math.dot(wCap0 - wSide0, nAB));
+            float depth1 = math.abs(math.dot(wCap1 - wSide1, nAB));
+            float depth = math.max(depth0, depth1);
+
+            // Numerical guard: if nAB is slightly off, fall back to plane penetration projected onto nAB.
+            //float depthFallback = penDeepPlane * math.max(0f, math.dot(capNormalOut, nAB));
+            //if (depth0 <= kSlop) depth0 = depthFallback;
+            //if (depth1 <= kSlop) depth1 = depthFallback;
+
+            //float depth = math.max(depth0, depth1);
+            if (depth <= kSlop)
+                return false;
+
+            // Emit exactly 2 contacts, points located ON the penetrating edge (wSide*).
+            cc = default;
+            InvalidateAll(ref cc);
+
+            ContactPoint cp0; cp0.point = wSide0; cp0.normal = nAB; cp0.depth = depth;
+            ContactPoint cp1; cp1.point = wSide1; cp1.normal = nAB; cp1.depth = depth;
+
+            Write(ref cc, 0, cp0);
+            Write(ref cc, 1, cp1);
+            cc.numContactPoints = 2;
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = math.max(satDepth, depth); // keep MTV at least as big as this feature depth
+            return true;
         }
 
         private static bool BuildCapCapParallelManifold(
