@@ -111,14 +111,186 @@ namespace Shard.Dev
                 return false;
             }
 
-            // 3) Side-Side
+            // 3) Side-Side vs Side-Cap classification using MTV axis.
+            // Side-side means MTV is mostly radial for BOTH cylinders (not axial-ish).
+            float daSide = math.abs(math.dot(mtvAxis, aAxis));
+            float dbSide = math.abs(math.dot(mtvAxis, bAxis));
 
-            // 4) Side-Cap
+            // If MTV is not strongly aligned with either axis, treat as side-side.
+            bool sideSide = (daSide < 0.85f) && (dbSide < 0.85f);
 
-            // TODO: side-side + cap-side (later)
-            // For now, just report collision with no manifold:
+            if (sideSide)
+            {
+                if (BuildSideSideManifold(in a, in b, aAxis, bAxis, mtvAxis, mtvDepth, out cc))
+                    return true;
+
+                // SAT said overlap, but manifold failed (degenerate). Up to you:
+                return false;
+            }
+
+            // 4) Side-Cap (TODO)
             return false;
         }
+
+        #region Side-Side
+        // ------------------------------------------------------------
+        // SIDE-SIDE manifold
+        // ------------------------------------------------------------
+        // Rules:
+        //  - Always tries to emit 2 points (ends of the shared side-band).
+        //  - Points are clamped to BOTH finite cylinders (via axis segment clamping).
+        //  - Uses MTV axis as the contact normal (A -> B).
+        private static bool BuildSideSideManifold(
+            in Cylinder a, in Cylinder b,
+            float3 aAxisW, float3 bAxisW,
+            float3 n, float depth,
+            out CylinderCylinderContactPoints cc)
+        {
+            cc = default;
+            InvalidateAll(ref cc);
+
+            if (depth <= kSlop)
+                return false;
+
+            // Ensure a stable radial normal for side witnesses:
+            // remove any component along A axis (side surface normal must be perpendicular to axis).
+            float3 nA = n - aAxisW * math.dot(n, aAxisW);
+            float nALenSq = math.lengthsq(nA);
+
+            if (nALenSq <= 1e-10f)
+            {
+                // Fallback: use center-to-center radial projected off A axis
+                float3 cTo = b.center - a.center;
+                nA = cTo - aAxisW * math.dot(cTo, aAxisW);
+                nALenSq = math.lengthsq(nA);
+
+                if (nALenSq <= 1e-10f)
+                {
+                    // Final fallback: any perp to A axis
+                    nA = AnyPerp(aAxisW);
+                    nALenSq = math.lengthsq(nA);
+                }
+            }
+
+            float3 nSide = nA * math.rsqrt(nALenSq);
+
+            // If axes are NOT parallel-ish, there is no shared side band (unique closest pair) => 1 CP.
+            bool axesParallel = math.abs(math.dot(aAxisW, bAxisW)) > kAxisParallel;
+            if (!axesParallel)
+            {
+                ClosestPoints_SegmentSegment(
+                    a.center, aAxisW, -a.halfHeight, a.halfHeight,
+                    b.center, bAxisW, -b.halfHeight, b.halfHeight,
+                    out float sA, out float tB);
+
+                float3 pA_axis = a.center + aAxisW * sA;
+                float3 pB_axis = b.center + bAxisW * tB;
+
+                // More accurate radial direction from the closest pair (still perpendicular to A axis).
+                float3 sep = pB_axis - pA_axis;
+                float3 r = sep - aAxisW * math.dot(sep, aAxisW);
+                float rLenSq = math.lengthsq(r);
+                float3 nSideLocal = (rLenSq > 1e-10f) ? (r * math.rsqrt(rLenSq)) : nSide;
+
+                float3 wA = pA_axis + nSideLocal * a.radius;
+                float3 wB = pB_axis - nSideLocal * b.radius;
+
+                ContactPoint cp;
+                cp.point = 0.5f * (wA + wB);
+                cp.normal = n;      // keep SAT MTV axis
+                cp.depth = depth;
+
+                Write(ref cc, 0, cp);
+                cc.numContactPoints = 1;
+                cc.globalPenAxis = n;
+                cc.globalPenDepth = depth;
+
+                DedupAndCompact(ref cc);
+                return cc.numContactPoints > 0;
+            }
+
+            // --------------------------------------------------------
+            // Find the shared "side band" along A's axis where B exists
+            // (works for parallel and skew axes).
+            //
+            // A axis parameter s in [-a.hh, +a.hh]
+            // B projected interval onto A-axis:
+            //   center projection = dot((b.c - a.c), aAxis)
+            //   extent = b.hh * abs(dot(bAxis, aAxis))
+            // --------------------------------------------------------
+            float cAlongA = math.dot(b.center - a.center, aAxisW);
+            float bAlongA = math.dot(bAxisW, aAxisW);
+            float bExtentAlongA = b.halfHeight * math.abs(bAlongA);
+
+            float aMin = -a.halfHeight;
+            float aMax = a.halfHeight;
+
+            float bMinOnA = cAlongA - bExtentAlongA;
+            float bMaxOnA = cAlongA + bExtentAlongA;
+
+            float bandMin = math.max(aMin, bMinOnA);
+            float bandMax = math.min(aMax, bMaxOnA);
+
+            // If no shared band, this isn't side-side per your rules (cap involved).
+            if (bandMax < bandMin + 1e-6f)
+                return false;
+
+            // Pick 2 points at the ends of the overlap band (max 2 contacts).
+            float s0 = bandMin;
+            float s1 = bandMax;
+
+            int count = 0;
+
+            if (EmitSideSidePoint(in a, in b, aAxisW, bAxisW, nSide, n, depth, s0, out var cp0))
+                Write(ref cc, count++, cp0);
+
+            if (EmitSideSidePoint(in a, in b, aAxisW, bAxisW, nSide, n, depth, s1, out var cp1))
+                Write(ref cc, count++, cp1);
+
+            if (count == 0)
+                return false;
+
+            cc.numContactPoints = count;
+            cc.globalPenAxis = n;      // keep MTV axis as global penetration axis
+            cc.globalPenDepth = depth;
+
+            DedupAndCompact(ref cc);
+            return cc.numContactPoints > 0;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool EmitSideSidePoint(
+            in Cylinder a, in Cylinder b,
+            float3 aAxisW, float3 bAxisW,
+            float3 nSide,      // stable radial direction used for side witnesses (perp to A axis)
+            float3 mtvAxis,    // global MTV axis (A -> B)
+            float depth,
+            float sA,          // parameter along A axis in [-a.hh, +a.hh]
+            out ContactPoint cp)
+        {
+            cp = default;
+
+            // Point on A axis segment
+            float3 pA_axis = a.center + aAxisW * sA;
+
+            // Closest point on B axis segment to that point
+            float tB = math.dot(pA_axis - b.center, bAxisW);
+            tB = math.clamp(tB, -b.halfHeight, b.halfHeight);
+            float3 pB_axis = b.center + bAxisW * tB;
+
+            // Build witnesses on side surfaces using nSide.
+            // A witness is offset outward from A axis; B witness is offset inward toward A.
+            float3 wA = pA_axis + nSide * a.radius;
+            float3 wB = pB_axis - nSide * b.radius;
+
+            // Shared stable point
+            cp.point = 0.5f * (wA + wB);
+            cp.normal = mtvAxis;
+            cp.depth = depth;
+            return true;
+        }
+
+        #endregion
 
         private static bool SAT_CylinderCylinder(
             in Cylinder a, in Cylinder b,
@@ -225,6 +397,7 @@ namespace Shard.Dev
             out CylinderCylinderContactPoints cc)
         {
             cc = default;
+            InvalidateAll(ref cc);
 
             if (depth <= kSlop)
                 return false;
@@ -527,10 +700,10 @@ namespace Shard.Dev
             Span<ContactPoint> tmp = stackalloc ContactPoint[4];
             int count = 0;
 
-            if (cc.p1.depth >= 0f) tmp[count++] = cc.p1;
-            if (cc.p2.depth >= 0f) tmp[count++] = cc.p2;
-            if (cc.p3.depth >= 0f) tmp[count++] = cc.p3;
-            if (cc.p4.depth >= 0f) tmp[count++] = cc.p4;
+            if (cc.p1.depth > 0f) tmp[count++] = cc.p1;
+            if (cc.p2.depth > 0f) tmp[count++] = cc.p2;
+            if (cc.p3.depth > 0f) tmp[count++] = cc.p3;
+            if (cc.p4.depth > 0f) tmp[count++] = cc.p4;
 
             Span<ContactPoint> outPts = stackalloc ContactPoint[4];
             int outCount = 0;
@@ -573,5 +746,51 @@ namespace Shard.Dev
             else if (index == 2) cc.p3 = cp;
             else if (index == 3) cc.p4 = cp;
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void InvalidateAll(ref CylinderCylinderContactPoints cc)
+        {
+            cc.p1.depth = -1f;
+            cc.p2.depth = -1f;
+            cc.p3.depth = -1f;
+            cc.p4.depth = -1f;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void ClosestPoints_SegmentSegment(
+            float3 p0, float3 u, float sMin, float sMax,
+            float3 q0, float3 v, float tMin, float tMax,
+            out float s, out float t)
+        {
+            float3 w0 = p0 - q0;
+            float b = math.dot(u, v);
+            float d = math.dot(u, w0);
+            float e = math.dot(v, w0);
+
+            float denom = 1f - b * b;
+
+            if (denom > 1e-8f)
+            {
+                s = (b * e - d) / denom;
+                t = (e - b * d) / denom;
+            }
+            else
+            {
+                // nearly parallel fallback
+                s = 0f;
+                t = e;
+            }
+
+            s = math.clamp(s, sMin, sMax);
+
+            // clamp t based on s
+            t = math.dot((p0 + u * s) - q0, v);
+            t = math.clamp(t, tMin, tMax);
+
+            // re-clamp s based on t (one iteration)
+            s = math.dot((q0 + v * t) - p0, u);
+            s = math.clamp(s, sMin, sMax);
+        }
+
     }
 }
