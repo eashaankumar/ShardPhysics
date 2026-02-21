@@ -308,10 +308,11 @@ namespace Shard.Dev
             if (math.abs(math.dot(sideAxis, capAxis)) < kCapSideParallelEps)
             {
                 if (!BuildCapSideAxisInCapPlaneManifold(
-                        in capCyl, capCenter, capAxis,
-                        in sideCyl, sideAxis,
-                        aIsCap,
-                        out cc))
+                    in capCyl, capCenter, capAxis,
+                    in sideCyl, sideAxis,
+                    aIsCap,
+                    mtvAxis, satDepth,
+                    out cc))
                     return false;
 
                 return true;
@@ -330,10 +331,10 @@ namespace Shard.Dev
             // Orient normal as A->B (your convention everywhere else)
             // nSideOut points from SIDE cylinder axis -> cap point (i.e., from SIDE toward CAP).
             // If CAP is A and SIDE is B, then A->B is opposite that.
-            float3 nAB = aIsCap ? -nSideOut : nSideOut;
+            float3 nAB = aIsCap ? -aAxisW : -bAxisW;
 
             ContactPoint cp;
-            cp.point = 0.5f * (wCap + wSide);
+            cp.point = wSide;
             cp.normal = nAB;
             cp.depth = penDepth;
 
@@ -353,10 +354,14 @@ namespace Shard.Dev
     in Cylinder cap, float3 capCenter, float3 capAxis,
     in Cylinder side, float3 sideAxis,
     bool capIsA,
+    float3 mtvAxisAB, float satDepth,   // NEW: penetration axis (A->B) and depth
     out CylinderCylinderContactPoints cc)
         {
             cc = default;
             InvalidateAll(ref cc);
+
+            if (satDepth <= kSlop)
+                return false;
 
             // sideAxis lies in cap plane (by caller)
             if (math.abs(math.dot(sideAxis, capAxis)) > kCapSideParallelEps)
@@ -379,11 +384,10 @@ namespace Shard.Dev
             float h = math.dot(side.center - capCenter, capAxis);
             float hAbs = math.abs(h);
 
-            float rSide = side.radius;
-            if (hAbs > rSide + 1e-6f)
+            if (hAbs > side.radius + 1e-6f)
                 return false;
 
-            float sMax = math.sqrt(math.max(0f, rSide * rSide - h * h));
+            float sMax = math.sqrt(math.max(0f, side.radius * side.radius - h * h));
             if (sMax <= 1e-6f)
                 return false;
 
@@ -392,19 +396,22 @@ namespace Shard.Dev
             float xAxis = math.dot(axisOnPlane - capCenter, p);
 
             float R = cap.radius;
-            float xp = math.clamp(xAxis, -R, +R);
 
-            float distToAxisLine = math.abs(xp - xAxis);
-
-            float penDepth = sMax - distToAxisLine;
-            if (penDepth <= kSlop)
+            // Feasibility: disk interval [-R, +R] overlaps strip interval [xAxis - sMax, xAxis + sMax]
+            float overlap1D = (R + sMax) - math.abs(xAxis);
+            if (overlap1D <= kSlop)
                 return false;
 
+            // Choose a chord within disk at x = clamp(xAxis, -R, +R)
+            float xp = math.clamp(xAxis, -R, +R);
             float y = math.sqrt(math.max(0f, R * R - xp * xp));
+            if (y <= 1e-8f)
+                return false;
 
             float3 chord0 = capCenter + p * xp + d * (-y);
             float3 chord1 = capCenter + p * xp + d * (+y);
 
+            // Clip chord to finite side height
             if (!ClipChordToFiniteSideHeight(
                     chord0, chord1,
                     side.center, sideAxis, side.halfHeight,
@@ -413,45 +420,37 @@ namespace Shard.Dev
                 return false;
             }
 
-            // ------------------------------------------------------------
-            // FIX: Per-contact radial normals (SIDE -> CAP) for the deepest points
-            // ------------------------------------------------------------
-            float3 n0SideOut = RadialFromSideAxisToPoint_Clamped(c0, side.center, sideAxis, side.halfHeight);
-            float3 n1SideOut = RadialFromSideAxisToPoint_Clamped(c1, side.center, sideAxis, side.halfHeight);
-
-            // Orient A->B
-            float3 n0AB = capIsA ? -n0SideOut : n0SideOut;
-            float3 n1AB = capIsA ? -n1SideOut : n1SideOut;
-
-            // Side witnesses (true side surface points)
+            // ---- Contact points MUST be ON SIDE surface (your requirement) ----
             float3 wSide0 = SideWitnessForCapPoint(c0, side.center, sideAxis, side.halfHeight, side.radius);
             float3 wSide1 = SideWitnessForCapPoint(c1, side.center, sideAxis, side.halfHeight, side.radius);
+
+            // Normal should be the penetration axis direction (A->B), since your depth is defined along it.
+            float3 nAB = mtvAxisAB;
+            // (mtvAxisAB should already be oriented A->B by SAT; keep this here for safety if you ever pass a forced axis)
+            // if (math.dot(nAB, (capIsA ? (side.center - cap.center) : (cap.center - side.center))) < 0f) nAB = -nAB;
 
             int count = 0;
 
             ContactPoint cp0;
-            cp0.point = 0.5f * (c0 + wSide0);
-            cp0.normal = n0AB;        // per-contact radial
-            cp0.depth = penDepth;
+            cp0.point = wSide0;     // ON SIDE
+            cp0.normal = nAB;        // pen axis
+            cp0.depth = satDepth;   // pen depth along pen axis (uniform)
             Write(ref cc, count++, cp0);
 
             ContactPoint cp1;
-            cp1.point = 0.5f * (c1 + wSide1);
-            cp1.normal = n1AB;        // per-contact radial
-            cp1.depth = penDepth;
+            cp1.point = wSide1;     // ON SIDE
+            cp1.normal = nAB;
+            cp1.depth = satDepth;
             Write(ref cc, count++, cp1);
 
             cc.numContactPoints = count;
-
-            // Global axis: average (stable). Fallback to first if they oppose.
-            float3 nSum = n0AB + n1AB;
-            float nSumLenSq = math.lengthsq(nSum);
-            cc.globalPenAxis = (nSumLenSq > 1e-12f) ? (nSum * math.rsqrt(nSumLenSq)) : n0AB;
-            cc.globalPenDepth = penDepth;
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = satDepth;
 
             DedupAndCompact(ref cc);
             return cc.numContactPoints > 0;
         }
+
 
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -753,17 +752,105 @@ namespace Shard.Dev
             if (penDepth <= kSlop)
                 return false;
 
-            float3 rN;
-            if (rLen > 1e-10f) rN = r / rLen;
-            else rN = AnyPerp(sideAxis);
+            //float3 rN;
+            //if (rLen > 1e-10f) rN = r / rLen;
+            //else rN = AnyPerp(sideAxis);
 
             // Witnesses
             wCap = bestDiskP;
-            wSide = bestSegP + rN * side.radius;
 
-            // ALWAYS radial (SIDE -> CAP)
-            nSideOut = rN;
+            // Compute a stable radial dir (SIDE axis -> CAP point), even in near-zero cases.
+            // Use capCenter (or wCap) as the reference for fallback so direction points "toward the cap".
+            float3 rN = StableRadialDirFromAxisToPoint(bestSegP, wCap, sideAxis, capCenter);
+
+            // Two possible side surface points (opposite sides of the side cylinder)
+            float3 wSideA = bestSegP + rN * side.radius;
+            float3 wSideB = bestSegP - rN * side.radius;
+
+            // Choose the one that is INSIDE the cap cylinder (penetrating witness).
+            float mA = CapContainmentMargin(in cap, capAxis, wSideA);
+            float mB = CapContainmentMargin(in cap, capAxis, wSideB);
+
+            // Prefer the one with bigger containment margin (more inside).
+            // If both similar, pick whichever is closer to wCap.
+            bool pickA;
+            const float marginTie = 1e-6f;
+
+            if (mA > mB + marginTie) pickA = true;
+            else if (mB > mA + marginTie) pickA = false;
+            else
+            {
+                float dA = math.lengthsq(wSideA - wCap);
+                float dB = math.lengthsq(wSideB - wCap);
+                pickA = dA <= dB;
+            }
+
+            wSide = pickA ? wSideA : wSideB;
+
+            // Now define nSideOut consistently as SIDE -> CAP at the chosen side point.
+            // That’s the radial normal on the side surface pointing toward the cap volume.
+            float3 nOut = wCap - bestSegP;
+            nOut -= sideAxis * math.dot(nOut, sideAxis);
+            float nLenSq = math.lengthsq(nOut);
+            if (nLenSq > 1e-20f) nOut *= math.rsqrt(nLenSq);
+            else
+            {
+                // if degenerate, derive it from chosen side
+                float3 tmp = (pickA ? +rN : -rN);
+                nOut = tmp;
+            }
+
+            // Ensure nOut points from SIDE surface toward CAP (so that wSide is the penetrating witness)
+            // i.e., wSide should be "behind" the cap along -nOut
+            if (math.dot(nOut, (wCap - wSide)) < 0f)
+                nOut = -nOut;
+
+            nSideOut = nOut;
             return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float CapContainmentMargin(in Cylinder cap, float3 capAxis, float3 p)
+        {
+            // Margin > 0 means inside (by that amount). Margin < 0 means outside.
+            float t = math.dot(p - cap.center, capAxis);
+            float tClamped = math.clamp(t, -cap.halfHeight, +cap.halfHeight);
+            float slabOutside = math.abs(t) - cap.halfHeight; // >0 if outside slab
+
+            float3 pAxis = cap.center + capAxis * tClamped;
+            float3 r = p - pAxis;
+            r -= capAxis * math.dot(r, capAxis);
+            float radial = math.length(r);
+
+            float radialMargin = cap.radius - radial; // >0 inside radius
+            float slabMargin = -math.max(0f, slabOutside); // 0 if inside slab, negative if outside
+
+            // If outside slab, slabMargin is negative; if inside slab, slabMargin is 0.
+            // Combine by taking the minimum constraint (tightest).
+            return math.min(radialMargin, slabMargin);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 StableRadialDirFromAxisToPoint(float3 axisPoint, float3 point, float3 axisDir, float3 fallbackRef)
+        {
+            // returns unit vector perpendicular to axisDir
+            float3 r = point - axisPoint;
+            r -= axisDir * math.dot(r, axisDir);
+            float rLenSq = math.lengthsq(r);
+
+            if (rLenSq > 1e-20f)
+                return r * math.rsqrt(rLenSq);
+
+            // fallback: use fallbackRef projected perp to axisDir
+            float3 f = fallbackRef - axisPoint;
+            f -= axisDir * math.dot(f, axisDir);
+            float fLenSq = math.lengthsq(f);
+
+            if (fLenSq > 1e-20f)
+                return f * math.rsqrt(fLenSq);
+
+            // final fallback
+            return AnyPerp(axisDir);
         }
 
 
