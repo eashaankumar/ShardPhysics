@@ -88,64 +88,165 @@ namespace Shard.Dev
             float3 aAxis = GetAxis(in a);
             float3 bAxis = GetAxis(in b);
 
-            // 1) Narrow-phase overlap test (SAT) -> gives MTV axis (A->B) and depth
-            if (!SAT_CylinderCylinder(in a, in b, aAxis, bAxis, out float3 mtvAxis, out float mtvDepth))
+            if (!SAT_CylinderCylinder(in a, in b, aAxis, bAxis, out float3 satAxisAB, out float satDepth))
                 return false;
 
-            // Fill globals (even if we return early via cap-cap)
-            cc.globalPenAxis = mtvAxis;
-            cc.globalPenDepth = mtvDepth;
+            cc.globalPenAxis = satAxisAB;
+            cc.globalPenDepth = satDepth;
 
-            // 2) Classify CAP-CAP:
-            // For cap-cap, MTV axis must be axial-ish for BOTH cylinders (axes parallel-ish too)
-            float da = math.abs(math.dot(mtvAxis, aAxis));
-            float db = math.abs(math.dot(mtvAxis, bAxis));
+            float3 cTo = b.center - a.center;
+
+            // -------------------------
+            // CAP-CAP
+            // -------------------------
+            float da = math.abs(math.dot(satAxisAB, aAxis));
+            float db = math.abs(math.dot(satAxisAB, bAxis));
             bool capCap = (da > 0.999f) && (db > 0.999f);
 
             if (capCap)
             {
-                // Builds up to 4 rim points, clamped in the intersecting plane
-                if (BuildCapCapManifold(in a, in b, aAxis, bAxis, mtvAxis, mtvDepth, out cc))
+                if (BuildCapCapManifold(in a, in b, aAxis, bAxis, satAxisAB, satDepth, out cc))
                     return true;
-
-                // If something degenerate happens, fall back to "colliding but no manifold"
-                // (you can choose to return false here, but SAT already said overlap)
                 return false;
             }
 
-            // 3) Side-Side vs Side-Cap classification using MTV axis.
-            // Side-side means MTV is mostly radial for BOTH cylinders (not axial-ish).
-            float daSide = math.abs(math.dot(mtvAxis, aAxis));
-            float dbSide = math.abs(math.dot(mtvAxis, bAxis));
+            // -------------------------
+            // SIDE-SIDE "looks like" fast path
+            // -------------------------
+            float daSide = math.abs(math.dot(satAxisAB, aAxis));
+            float dbSide = math.abs(math.dot(satAxisAB, bAxis));
+            bool looksSideSide = (daSide < 0.85f) && (dbSide < 0.85f);
 
-            // If MTV is not strongly aligned with either axis, treat as side-side.
-            bool sideSide = (daSide < 0.85f) && (dbSide < 0.85f);
-
-            if (sideSide)
+            if (looksSideSide)
             {
-                if (BuildSideSideManifold(in a, in b, aAxis, bAxis, mtvAxis, mtvDepth, out cc))
+                if (BuildSideSideManifold(in a, in b, aAxis, bAxis, satAxisAB, satDepth, out cc))
                     return true;
-
-                // SAT said overlap, but manifold failed (degenerate). Up to you:
-                return false;
             }
 
-            // 4) Cap-Side (cap-involved => exactly 1 CP by your rule)
-            // MTV is axial-ish for one cylinder, but not the other.
-            bool aAxial = daSide > 0.85f;
-            bool bAxial = dbSide > 0.85f;
+            // -------------------------
+            // CAP-SIDE tries
+            // -------------------------
+            if (BuildCapSideManifold(in a, in b, aAxis, bAxis, satAxisAB, satDepth, out cc))
+                return true;
 
-            bool capSide = (aAxial ^ bAxial); // exactly one is axial-ish
-            if (capSide)
+            // Force A-as-cap
             {
-                if (BuildCapSideManifold(in a, in b, aAxis, bAxis, mtvAxis, mtvDepth, out cc))
+                float s = math.dot(aAxis, cTo) >= 0f ? 1f : -1f;
+                float3 forceAxisA = aAxis * s;
+                if (BuildCapSideManifold(in a, in b, aAxis, bAxis, forceAxisA, satDepth, out cc))
                     return true;
 
-                return false;
+                forceAxisA = -forceAxisA;
+                if (BuildCapSideManifold(in a, in b, aAxis, bAxis, forceAxisA, satDepth, out cc))
+                    return true;
             }
 
-            return false;
+            // Force B-as-cap
+            {
+                float s = math.dot(bAxis, (a.center - b.center)) >= 0f ? 1f : -1f;
+                float3 bTowardA = bAxis * s;
+                float3 forceAxisB = -bTowardA;
+                if (BuildCapSideManifold(in a, in b, aAxis, bAxis, forceAxisB, satDepth, out cc))
+                    return true;
+
+                forceAxisB = -forceAxisB;
+                if (BuildCapSideManifold(in a, in b, aAxis, bAxis, forceAxisB, satDepth, out cc))
+                    return true;
+            }
+
+            // -------------------------
+            // FIXED FALLBACK:
+            // If we get here, SAT says overlap but neither manifold path triggered.
+            // This is your "deadzone". It is usually CAP-SIDE-ish, so we must NOT
+            // generate a "side witness on the cap cylinder" or use a cap-plane normal.
+            //
+            // We'll build a CAP-SIDE contact by clamping a cap point to the cap disk,
+            // and using the other cylinder's SIDE radial for the normal.
+            // -------------------------
+            {
+                // Closest points on finite axis segments
+                ClosestPoints_SegmentSegment(
+                    a.center, aAxis, -a.halfHeight, a.halfHeight,
+                    b.center, bAxis, -b.halfHeight, b.halfHeight,
+                    out float sA, out float tB);
+
+                // Determine if either segment point is near an end-cap (cap involvement)
+                const float endFrac = 0.98f; // tweak if you want earlier/later snap
+                bool aNearCap = math.abs(sA) > a.halfHeight * endFrac;
+                bool bNearCap = math.abs(tB) > b.halfHeight * endFrac;
+
+                // If cap-ish, prefer that cylinder as the cap cylinder.
+                // If both/none, fall back to which axis SAT is more aligned with.
+                bool capIsA;
+                if (aNearCap ^ bNearCap) capIsA = aNearCap;
+                else capIsA = (math.abs(math.dot(satAxisAB, aAxis)) > math.abs(math.dot(satAxisAB, bAxis)));
+
+                Cylinder capCyl = capIsA ? a : b;
+                Cylinder sideCyl = capIsA ? b : a;
+
+                float3 capAxis = capIsA ? aAxis : bAxis;
+                float3 sideAxis = capIsA ? bAxis : aAxis;
+
+                // Pick which cap (top/bottom) based on the closest axis param sign
+                float capParam = capIsA ? sA : tB;
+                float capSign = (capParam >= 0f) ? 1f : -1f;
+                float3 capCenter = capCyl.center + capAxis * (capSign * capCyl.halfHeight);
+
+                // Build cap point by projecting SIDE axis point onto cap plane and clamping to disk
+                float3 sideAxisPoint = sideCyl.center + sideAxis * math.clamp(
+                    math.dot((capCenter - sideCyl.center), sideAxis),
+                    -sideCyl.halfHeight, +sideCyl.halfHeight);
+
+                // Cap plane basis
+                float3 u = AnyPerp(capAxis);
+                float3 v = math.normalize(math.cross(capAxis, u));
+
+                // Project side axis point onto cap plane
+                float3 proj = sideAxisPoint - capAxis * math.dot(sideAxisPoint - capCenter, capAxis);
+
+                // Clamp to filled cap disk (THIS guarantees inside the cap cylinder)
+                float3 capPoint = ClampPointToDiskPlane(proj, capCenter, capCyl.radius, u, v);
+
+                // Side witness on SIDE cylinder (true side surface point)
+                float3 wSide = SideWitnessForCapPoint(capPoint, sideCyl.center, sideAxis, sideCyl.halfHeight, sideCyl.radius);
+
+                // Radial normal from SIDE centerline -> cap point (THIS is the radial you want)
+                float3 nSideOut = RadialFromSideAxisToPoint_Clamped(capPoint, sideCyl.center, sideAxis, sideCyl.halfHeight);
+
+                // Orient A->B
+                float3 nAB = capIsA ? -nSideOut : nSideOut;
+                if (math.dot(nAB, cTo) < 0f) nAB = -nAB;
+
+                // Pen depth from side radius minus radial distance
+                float t = math.dot(capPoint - sideCyl.center, sideAxis);
+                t = math.clamp(t, -sideCyl.halfHeight, +sideCyl.halfHeight);
+                float3 pAxis = sideCyl.center + sideAxis * t;
+
+                float3 r = capPoint - pAxis;
+                r -= sideAxis * math.dot(r, sideAxis);
+                float rLen = math.length(r);
+                float penDepth = sideCyl.radius - rLen;
+                if (penDepth <= kSlop) penDepth = satDepth;
+
+                InvalidateAll(ref cc);
+
+                ContactPoint cp;
+                cp.point = 0.5f * (capPoint + wSide);
+                cp.normal = nAB;
+                cp.depth = penDepth;
+
+                Write(ref cc, 0, cp);
+                cc.numContactPoints = 1;
+                cc.globalPenAxis = nAB;
+                cc.globalPenDepth = penDepth;
+
+                DedupAndCompact(ref cc);
+                return cc.numContactPoints > 0;
+            }
         }
+
+
+
 
         #region Cap-Side
         private static void EmitOneRimPoint(
@@ -693,16 +794,18 @@ namespace Shard.Dev
         //  - Points are clamped to BOTH finite cylinders (via axis segment clamping).
         //  - Uses MTV axis as the contact normal (A -> B).
         private static bool BuildSideSideManifold(
-            in Cylinder a, in Cylinder b,
-            float3 aAxisW, float3 bAxisW,
-            float3 n, float depth,
-            out CylinderCylinderContactPoints cc)
+    in Cylinder a, in Cylinder b,
+    float3 aAxisW, float3 bAxisW,
+    float3 n, float depth,
+    out CylinderCylinderContactPoints cc)
         {
             cc = default;
             InvalidateAll(ref cc);
 
             if (depth <= kSlop)
                 return false;
+
+            float3 cTo = b.center - a.center;
 
             // Ensure a stable radial normal for side witnesses:
             // remove any component along A axis (side surface normal must be perpendicular to axis).
@@ -712,7 +815,6 @@ namespace Shard.Dev
             if (nALenSq <= 1e-10f)
             {
                 // Fallback: use center-to-center radial projected off A axis
-                float3 cTo = b.center - a.center;
                 nA = cTo - aAxisW * math.dot(cTo, aAxisW);
                 nALenSq = math.lengthsq(nA);
 
@@ -738,24 +840,51 @@ namespace Shard.Dev
                 float3 pA_axis = a.center + aAxisW * sA;
                 float3 pB_axis = b.center + bAxisW * tB;
 
-                // More accurate radial direction from the closest pair (still perpendicular to A axis).
                 float3 sep = pB_axis - pA_axis;
+
+                // Prefer a radial perpendicular to A axis
                 float3 r = sep - aAxisW * math.dot(sep, aAxisW);
                 float rLenSq = math.lengthsq(r);
-                float3 nSideLocal = (rLenSq > 1e-10f) ? (r * math.rsqrt(rLenSq)) : nSide;
 
-                float3 wA = pA_axis + nSideLocal * a.radius;
-                float3 wB = pB_axis - nSideLocal * b.radius;
+                float3 nLocal;
+                float dist;
+
+                if (rLenSq < 1e-12f)
+                {
+                    nLocal = nSide; // stable fallback
+                    dist = 0f;
+                }
+                else
+                {
+                    dist = math.sqrt(rLenSq);
+                    nLocal = r * (1.0f / dist);
+                }
+
+                // Ensure A->B
+                if (math.dot(nLocal, cTo) < 0f) nLocal = -nLocal;
+
+                float3 wA = pA_axis + nLocal * a.radius;
+                float3 wB = pB_axis - nLocal * b.radius;
+
+                // Pen depth along this radial
+                float penDepth = (a.radius + b.radius) - dist;
+
+                // If numerical weirdness makes this tiny/negative, fall back to SAT depth for stability
+                if (penDepth <= kSlop) penDepth = depth;
+
+                // ✅ Deepest shared point INSIDE BOTH cylinders
+                float3 deepPoint = wA - nLocal * (0.5f * penDepth);
 
                 ContactPoint cp;
-                cp.point = 0.5f * (wA + wB);
-                cp.normal = n;      // keep SAT MTV axis
-                cp.depth = depth;
+                cp.point = deepPoint;
+                cp.normal = nLocal;   // radial
+                cp.depth = penDepth;
 
                 Write(ref cc, 0, cp);
                 cc.numContactPoints = 1;
-                cc.globalPenAxis = n;
-                cc.globalPenDepth = depth;
+
+                cc.globalPenAxis = nLocal;
+                cc.globalPenDepth = penDepth;
 
                 DedupAndCompact(ref cc);
                 return cc.numContactPoints > 0;
@@ -763,12 +892,6 @@ namespace Shard.Dev
 
             // --------------------------------------------------------
             // Find the shared "side band" along A's axis where B exists
-            // (works for parallel and skew axes).
-            //
-            // A axis parameter s in [-a.hh, +a.hh]
-            // B projected interval onto A-axis:
-            //   center projection = dot((b.c - a.c), aAxis)
-            //   extent = b.hh * abs(dot(bAxis, aAxis))
             // --------------------------------------------------------
             float cAlongA = math.dot(b.center - a.center, aAxisW);
             float bAlongA = math.dot(bAxisW, aAxisW);
@@ -810,14 +933,15 @@ namespace Shard.Dev
             return cc.numContactPoints > 0;
         }
 
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool EmitSideSidePoint(
             in Cylinder a, in Cylinder b,
             float3 aAxisW, float3 bAxisW,
-            float3 nSide,      // stable radial direction used for side witnesses (perp to A axis)
-            float3 mtvAxis,    // global MTV axis (A -> B)
-            float depth,
-            float sA,          // parameter along A axis in [-a.hh, +a.hh]
+            float3 nSideFallback, // stable fallback direction (perp to A axis)
+            float3 mtvAxis,       // SAT MTV axis (A -> B), used only as fallback orientation
+            float satDepth,
+            float sA,             // parameter along A axis in [-a.hh, +a.hh]
             out ContactPoint cp)
         {
             cp = default;
@@ -830,17 +954,50 @@ namespace Shard.Dev
             tB = math.clamp(tB, -b.halfHeight, b.halfHeight);
             float3 pB_axis = b.center + bAxisW * tB;
 
-            // Build witnesses on side surfaces using nSide.
-            // A witness is offset outward from A axis; B witness is offset inward toward A.
-            float3 wA = pA_axis + nSide * a.radius;
-            float3 wB = pB_axis - nSide * b.radius;
+            float3 sep = pB_axis - pA_axis;
 
-            // Shared stable point
-            cp.point = 0.5f * (wA + wB);
-            cp.normal = mtvAxis;
-            cp.depth = depth;
+            // Radial direction (perp to A axis)
+            float3 r = sep - aAxisW * math.dot(sep, aAxisW);
+            float rLenSq = math.lengthsq(r);
+
+            float3 nLocal;
+            float dist;
+
+            if (rLenSq < 1e-12f)
+            {
+                // fallback: use provided stable direction
+                nLocal = nSideFallback;
+                dist = 0f;
+            }
+            else
+            {
+                dist = math.sqrt(rLenSq);
+                nLocal = r * (1.0f / dist);
+            }
+
+            // Ensure A -> B orientation
+            float3 cTo = b.center - a.center;
+            if (math.dot(nLocal, cTo) < 0f) nLocal = -nLocal;
+
+            // Side surface witnesses
+            float3 wA = pA_axis + nLocal * a.radius;
+            float3 wB = pB_axis - nLocal * b.radius;
+
+            // Pen depth along this radial
+            float penDepth = (a.radius + b.radius) - dist;
+
+            // If numerical weirdness makes this tiny/negative, fall back to SAT depth for stability
+            if (penDepth <= kSlop) penDepth = satDepth;
+
+            // ✅ Deepest shared point INSIDE BOTH cylinders
+            float3 deepPoint = wA - nLocal * (0.5f * penDepth);
+
+            cp.point = deepPoint;
+            cp.normal = nLocal;   // radial
+            cp.depth = penDepth;
             return true;
         }
+
 
         #endregion
 
