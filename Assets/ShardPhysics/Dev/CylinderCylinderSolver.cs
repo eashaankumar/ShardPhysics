@@ -1,16 +1,33 @@
-using System;
+ï»¿using System;
 using System.Runtime.CompilerServices;
 using Unity.Mathematics;
 
 namespace Shard.Dev
 {
+    // NOTE:
+    // This is a CYLINDER vs CYLINDER solver (finite cylinders, flat caps).
+    // It computes:
+    //  - globalPenAxis (A -> B)
+    //  - globalPenDepth (MTV magnitude)
+    //  - 1/2/4 contact points depending on configuration
+    //
+    // Rules (per your request):
+    //  - Side-side collision => 2 contact points (clamped).
+    //  - Face-face (cap-cap overlap) => up to 4 contact points, equally distributed,
+    //    ALWAYS ON RIMS, clamped to BOTH cylinders, and lying on the intersecting plane.
+    //  - 1 contact point only when:
+    //      * they don't share a side band OR
+    //      * one cap intersects anywhere on the other (cap-involved)
+    //
+    // IMPORTANT: Do NOT use capsule "segment distance + r" as the overlap test (false positives).
+    // We use SAT (or other exact test) to decide if colliding. Manifold generation must not invent collisions.
     public static class CylinderCylinderSolver
     {
         public struct ContactPoint
         {
-            public float3 point;   // stable shared point (midpoint of witnesses)
+            public float3 point;   // stable shared point (midpoint of two witnesses)
             public float3 normal;  // global MTV axis (A -> B)
-            public float depth;    // per-contact depth (debug/optional)
+            public float depth;    // per-contact depth (optional / debug)
         }
 
         public struct CylinderCylinderContactPoints
@@ -53,374 +70,446 @@ namespace Shard.Dev
             }
         }
 
-        private const float kAxisParallel = 0.9995f;
         private const float kSlop = 1e-5f;
         private const float kEpsLenSq = 1e-12f;
-
-        // For endpoint classification on axis segments (cap involvement)
-        private const float kEndEps = 1e-4f;
+        private const float kAxisParallel = 0.9995f;
+        private const float kDedupEpsSq = 1e-8f;
 
         // ------------------------------------------------------------
-        // Public solve
+        // Public API (placeholder narrowphase)
         // ------------------------------------------------------------
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool Solve(in Cylinder a, in Cylinder b, out CylinderCylinderContactPoints cc)
         {
             cc = default;
 
-            float3 aAxis = GetAxis(in a); // unit
-            float3 bAxis = GetAxis(in b); // unit
+            float3 aAxis = GetAxis(in a);
+            float3 bAxis = GetAxis(in b);
 
-            float3 a0, a1; GetSegment(in a, aAxis, out a0, out a1);
-            float3 b0, b1; GetSegment(in b, bAxis, out b0, out b1);
-
-            float align = math.abs(math.dot(aAxis, bAxis));
-            if (align >= kAxisParallel)
-            {
-                return SolveParallel(in a, in b, aAxis, out cc);
-            }
-
-            // General (skew) case: measure via closest points between axis segments.
-            ClosestPointsSegmentSegment(a0, a1, b0, b1, out float s, out float t, out float3 pA, out float3 pB);
-
-            float3 d = pB - pA;
-            float distSq = math.lengthsq(d);
-            float rSum = a.radius + b.radius;
-
-            if (distSq > (rSum + kSlop) * (rSum + kSlop))
+            // 1) Narrow-phase overlap test (SAT) -> gives MTV axis (A->B) and depth
+            if (!SAT_CylinderCylinder(in a, in b, aAxis, bAxis, out float3 mtvAxis, out float mtvDepth))
                 return false;
 
-            float dist = math.sqrt(math.max(0f, distSq));
-            float3 n = (distSq <= kEpsLenSq) ? StableNormalFromAxes(aAxis, bAxis) : (d / dist);
+            // Fill globals (even if we return early via cap-cap)
+            cc.globalPenAxis = mtvAxis;
+            cc.globalPenDepth = mtvDepth;
 
-            float penDepth = rSum - dist;
-            if (penDepth <= kSlop)
-                return false;
+            // 2) Classify CAP-CAP:
+            // For cap-cap, MTV axis must be axial-ish for BOTH cylinders (axes parallel-ish too)
+            float da = math.abs(math.dot(mtvAxis, aAxis));
+            float db = math.abs(math.dot(mtvAxis, bAxis));
+            bool capCap = (da > 0.999f) && (db > 0.999f);
 
-            // Rule:
-            // - side-side => 2 CPs (clamped)
-            // - 1 CP only if they don't share side OR any cap is involved
-            bool aCapInvolved = (s <= kEndEps) || (s >= 1f - kEndEps);
-            bool bCapInvolved = (t <= kEndEps) || (t >= 1f - kEndEps);
-            bool shareSide = !aCapInvolved && !bCapInvolved;
-
-            // Global MTV axis is A->B
-            if (math.dot(n, b.center - a.center) < 0f) n = -n;
-
-            cc.globalPenAxis = n;
-            cc.globalPenDepth = penDepth;
-
-            if (!shareSide)
+            if (capCap)
             {
-                // Single deepest / stable point
-                EmitMidpointWitnessAtAxisPoints(in a, in b, pA, pB, n, penDepth, ref cc.p1);
-                cc.numContactPoints = 1;
-                return true;
+                // Builds up to 4 rim points, clamped in the intersecting plane
+                if (BuildCapCapManifold(in a, in b, aAxis, bAxis, mtvAxis, mtvDepth, out cc))
+                    return true;
+
+                // If something degenerate happens, fall back to "colliding but no manifold"
+                // (you can choose to return false here, but SAT already said overlap)
+                return false;
             }
 
-            // Side-side: 2 points, separated along A's axis segment around s
-            // (Pick a symmetric offset in parameter space, clamp, then map to B by closest point)
-            float ds = 0.25f; // "equally distributed" along the shared side band (coarse but stable)
-            float sL = math.clamp(s - ds, 0f, 1f);
-            float sR = math.clamp(s + ds, 0f, 1f);
+            // 3) Side-Side
 
-            float3 pA_L = math.lerp(a0, a1, sL);
-            float3 pA_R = math.lerp(a0, a1, sR);
+            // 4) Side-Cap
 
-            float3 pB_L = ClosestPointOnSegment(b0, b1, pA_L);
-            float3 pB_R = ClosestPointOnSegment(b0, b1, pA_R);
-
-            // Contact normals can vary slightly per point in skew configurations.
-            // But keep them all aligned to global MTV axis for your solver’s “hard separation”.
-            EmitMidpointWitnessAtAxisPoints(in a, in b, pA_L, pB_L, n, penDepth, ref cc.p1);
-            EmitMidpointWitnessAtAxisPoints(in a, in b, pA_R, pB_R, n, penDepth, ref cc.p2);
-
-            // De-dupe
-            cc.numContactPoints = (math.lengthsq(cc.p2.point - cc.p1.point) > 1e-8f) ? 2 : 1;
-            return true;
+            // TODO: side-side + cap-side (later)
+            // For now, just report collision with no manifold:
+            return false;
         }
 
-        // ------------------------------------------------------------
-        // Parallel case: decide axial vs radial MTV, then build manifold
-        // ------------------------------------------------------------
-        private static bool SolveParallel(in Cylinder a, in Cylinder b, float3 axis, out CylinderCylinderContactPoints cc)
+        private static bool SAT_CylinderCylinder(
+            in Cylinder a, in Cylinder b,
+            float3 aAxis, float3 bAxis,
+            out float3 mtvAxis, out float mtvDepth)
         {
-            cc = default;
+            mtvAxis = float3.zero;
+            mtvDepth = float.MaxValue;
 
-            // Make axis roughly A->B for consistency
-            if (math.dot(axis, b.center - a.center) < 0f)
-                axis = -axis;
+            float3 cTo = b.center - a.center;
 
-            float3 dC = b.center - a.center;
-            float s = math.dot(dC, axis);
+            // Candidate axes
+            float3 ax0 = aAxis;
+            float3 ax1 = bAxis;
 
-            // radial separation between axes
-            float3 radial = dC - axis * s;
-            float radialDistSq = math.lengthsq(radial);
+            float3 ax2 = math.cross(aAxis, bAxis);
+            float ax2LenSq = math.lengthsq(ax2);
+            bool ax2Valid = ax2LenSq > 1e-10f;
+            if (ax2Valid) ax2 *= math.rsqrt(ax2LenSq);
 
-            float rSum = a.radius + b.radius;
-            if (radialDistSq > (rSum + kSlop) * (rSum + kSlop))
-                return false;
+            float3 radial = cTo - aAxis * math.dot(cTo, aAxis);
+            float rLenSq = math.lengthsq(radial);
+            bool radialValid = rLenSq > 1e-10f;
+            if (radialValid) radial *= math.rsqrt(rLenSq);
 
-            float radialDist = math.sqrt(math.max(0f, radialDistSq));
-            float radialOverlap = rSum - radialDist;
+            if (!TestAxis(ax0, in a, in b, aAxis, bAxis, ref mtvAxis, ref mtvDepth)) return false;
+            if (!TestAxis(ax1, in a, in b, aAxis, bAxis, ref mtvAxis, ref mtvDepth)) return false;
 
-            float axialOverlap = (a.halfHeight + b.halfHeight) - math.abs(s);
-            if (axialOverlap <= kSlop)
-                return false;
-
-            // Choose MTV axis (smaller overlap)
-            if (axialOverlap < radialOverlap)
+            if (ax2Valid)
             {
-                // MTV along axis (cap/cap or cap/side-ish)
-                float3 mtvAxis = (s >= 0f) ? axis : -axis;
-                float mtvDepth = axialOverlap;
-
-                cc.globalPenAxis = mtvAxis;
-                cc.globalPenDepth = mtvDepth;
-
-                // Axial intervals along mtvAxis
-                float aC = math.dot(a.center, mtvAxis);
-                float bC = math.dot(b.center, mtvAxis);
-                float aMin = aC - a.halfHeight;
-                float aMax = aC + a.halfHeight;
-                float bMin = bC - b.halfHeight;
-                float bMax = bC + b.halfHeight;
-
-                float overlapMin = math.max(aMin, bMin);
-                float overlapMax = math.min(aMax, bMax);
-                if (overlapMax - overlapMin <= kSlop)
+                if (!TestAxis(ax2, in a, in b, aAxis, bAxis, ref mtvAxis, ref mtvDepth))
                     return false;
-
-                // Determine containment along axis (both caps of one intersect)
-                bool aInsideB = (aMin >= bMin - 1e-6f) && (aMax <= bMax + 1e-6f);
-                bool bInsideA = (bMin >= aMin - 1e-6f) && (bMax <= aMax + 1e-6f);
-
-                // Orthonormal basis for the cap plane
-                float3 u = AnyPerp(mtvAxis);
-                float3 v = math.normalize(math.cross(mtvAxis, u));
-
-                if (aInsideB)
-                {
-                    // Both A caps intersect B somewhere => return 2 points (one per A cap), clamped to BOTH cylinders.
-                    float3 capTop = a.center + mtvAxis * a.halfHeight;
-                    float3 capBot = a.center - mtvAxis * a.halfHeight;
-
-                    EmitClampedPointOnBothCylinders(in a, in b, capTop, mtvAxis, u, v, a.radius, ref cc.p1, mtvAxis, mtvDepth);
-                    EmitClampedPointOnBothCylinders(in a, in b, capBot, mtvAxis, u, v, a.radius, ref cc.p2, mtvAxis, mtvDepth);
-
-                    cc.numContactPoints = (math.lengthsq(cc.p2.point - cc.p1.point) > 1e-8f) ? 2 : 1;
-                    return true;
-                }
-
-                if (bInsideA)
-                {
-                    // Both B caps intersect A somewhere => return 2 points (one per B cap), clamped to BOTH cylinders.
-                    float3 capTop = b.center + mtvAxis * b.halfHeight;
-                    float3 capBot = b.center - mtvAxis * b.halfHeight;
-
-                    EmitClampedPointOnBothCylinders(in a, in b, capTop, mtvAxis, u, v, b.radius, ref cc.p1, mtvAxis, mtvDepth);
-                    EmitClampedPointOnBothCylinders(in a, in b, capBot, mtvAxis, u, v, b.radius, ref cc.p2, mtvAxis, mtvDepth);
-
-                    cc.numContactPoints = (math.lengthsq(cc.p2.point - cc.p1.point) > 1e-8f) ? 2 : 1;
-                    return true;
-                }
-
-                // Otherwise: this is the classic face-face cap overlap (cap of A vs cap of B).
-                // Rule: stick to 4 points, equally distributed, clamped to BOTH cylinder intersection surfaces.
-
-                float3 aCapCenter = a.center + mtvAxis * a.halfHeight;   // cap facing B
-                float3 bCapCenter = b.center - mtvAxis * b.halfHeight;   // opposing cap facing A
-
-                // Put both disk centers into the same plane (A cap plane)
-                float3 bCapProj = bCapCenter - mtvAxis * math.dot(bCapCenter - aCapCenter, mtvAxis);
-
-                // A good "intersection center" seed: closest point in intersection (alternating projections)
-                float3 center = ClosestPointInDiskIntersection(aCapCenter, a.radius, bCapProj, b.radius, u, v);
-
-                // Four equally distributed directions (0/90/180/270)
-                // Choose a radius that lives comfortably inside the overlap.
-                float rPick = math.max(0f, math.min(a.radius, b.radius) * 0.85f);
-
-                float3 c0 = ClampPointToDiskIntersection(center + u * rPick, aCapCenter, a.radius, bCapProj, b.radius, u, v);
-                float3 c1 = ClampPointToDiskIntersection(center + v * rPick, aCapCenter, a.radius, bCapProj, b.radius, u, v);
-                float3 c2 = ClampPointToDiskIntersection(center - u * rPick, aCapCenter, a.radius, bCapProj, b.radius, u, v);
-                float3 c3 = ClampPointToDiskIntersection(center - v * rPick, aCapCenter, a.radius, bCapProj, b.radius, u, v);
-
-                EmitMidpointWitness(in a, in b, c0, mtvAxis, mtvDepth, ref cc.p1);
-                EmitMidpointWitness(in a, in b, c1, mtvAxis, mtvDepth, ref cc.p2);
-                EmitMidpointWitness(in a, in b, c2, mtvAxis, mtvDepth, ref cc.p3);
-                EmitMidpointWitness(in a, in b, c3, mtvAxis, mtvDepth, ref cc.p4);
-
-                // De-dupe if overlap is tiny
-                cc.numContactPoints = 1;
-                if (math.lengthsq(cc.p2.point - cc.p1.point) > 1e-8f) cc.numContactPoints = 2;
-                if (cc.numContactPoints == 2 && math.lengthsq(cc.p3.point - cc.p1.point) > 1e-8f && math.lengthsq(cc.p3.point - cc.p2.point) > 1e-8f) cc.numContactPoints = 3;
-                if (cc.numContactPoints == 3 && math.lengthsq(cc.p4.point - cc.p1.point) > 1e-8f && math.lengthsq(cc.p4.point - cc.p2.point) > 1e-8f && math.lengthsq(cc.p4.point - cc.p3.point) > 1e-8f) cc.numContactPoints = 4;
-
-                return true;
             }
             else
             {
-                // MTV radially => side-side, generate 2 CPs clamped (unless a cap intersects => 1)
-                float3 mtvAxis;
-                if (radialDistSq <= kEpsLenSq) mtvAxis = AnyPerp(axis);
-                else mtvAxis = radial / radialDist; // A->B
-                float mtvDepth = radialOverlap;
-
-                cc.globalPenAxis = mtvAxis;
-                cc.globalPenDepth = mtvDepth;
-
-                // Determine axial overlap interval (shared side band)
-                float aC = math.dot(a.center, axis);
-                float bC = math.dot(b.center, axis);
-                float aMin = aC - a.halfHeight;
-                float aMax = aC + a.halfHeight;
-                float bMin = bC - b.halfHeight;
-                float bMax = bC + b.halfHeight;
-
-                float oMin = math.max(aMin, bMin);
-                float oMax = math.min(aMax, bMax);
-
-                // If they don't share a side band (i.e., overlap degenerates), treat as cap involvement => 1 CP
-                if (oMax - oMin <= 1e-4f)
+                if (radialValid)
                 {
-                    float3 pA = a.center + axis * math.clamp(bC - aC, -a.halfHeight, a.halfHeight);
-                    float3 pB = b.center + axis * math.clamp(aC - bC, -b.halfHeight, b.halfHeight);
-
-                    EmitMidpointWitnessAtAxisPoints(in a, in b, pA, pB, mtvAxis, mtvDepth, ref cc.p1);
-                    cc.numContactPoints = 1;
-                    return true;
+                    if (!TestAxis(radial, in a, in b, aAxis, bAxis, ref mtvAxis, ref mtvDepth))
+                        return false;
                 }
-
-                // Two points, equally distributed along the overlapped axial interval
-                float t1 = math.lerp(oMin, oMax, 0.25f);
-                float t2 = math.lerp(oMin, oMax, 0.75f);
-
-                // Convert to world axis points (same axial coordinate for both, each clamped by its own caps)
-                float3 pA1 = a.center + axis * math.clamp(t1 - aC, -a.halfHeight, a.halfHeight);
-                float3 pB1 = b.center + axis * math.clamp(t1 - bC, -b.halfHeight, b.halfHeight);
-
-                float3 pA2 = a.center + axis * math.clamp(t2 - aC, -a.halfHeight, a.halfHeight);
-                float3 pB2 = b.center + axis * math.clamp(t2 - bC, -b.halfHeight, b.halfHeight);
-
-                EmitMidpointWitnessAtAxisPoints(in a, in b, pA1, pB1, mtvAxis, mtvDepth, ref cc.p1);
-                EmitMidpointWitnessAtAxisPoints(in a, in b, pA2, pB2, mtvAxis, mtvDepth, ref cc.p2);
-
-                cc.numContactPoints = (math.lengthsq(cc.p2.point - cc.p1.point) > 1e-8f) ? 2 : 1;
-                return true;
             }
+
+            // Orient A -> B
+            if (math.dot(mtvAxis, cTo) < 0f)
+                mtvAxis = -mtvAxis;
+
+            return true;
         }
 
-        // ------------------------------------------------------------
-        // Emission helpers (clamped to BOTH cylinder surfaces)
-        // ------------------------------------------------------------
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void EmitMidpointWitness(in Cylinder a, in Cylinder b, float3 seedPoint, float3 normal, float depth, ref ContactPoint outCp)
-        {
-            float3 wa = ClosestPointOnCylinderToPointWorld(in a, seedPoint);
-            float3 wb = ClosestPointOnCylinderToPointWorld(in b, seedPoint);
-            float3 c = 0.5f * (wa + wb);
-
-            outCp.point = c;
-            outCp.normal = normal;
-            outCp.depth = depth;
-        }
-
-        // Use axis points (on the center-lines) to build witnesses properly:
-        // witnessA = axisPointA + normal * rA
-        // witnessB = axisPointB - normal * rB
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void EmitMidpointWitnessAtAxisPoints(in Cylinder a, in Cylinder b, float3 axisPointA, float3 axisPointB, float3 normal, float depth, ref ContactPoint outCp)
-        {
-            float3 wa = axisPointA + normal * a.radius;
-            float3 wb = axisPointB - normal * b.radius;
-            float3 c = 0.5f * (wa + wb);
-
-            outCp.point = c;
-            outCp.normal = normal;
-            outCp.depth = depth;
-        }
-
-        // For “cap point” seeds: keep it in a given cap plane disk, then clamp to BOTH cylinder volumes.
-        private static void EmitClampedPointOnBothCylinders(
+        private static bool TestAxis(
+            float3 n,
             in Cylinder a, in Cylinder b,
-            float3 capSeed,
-            float3 capPlaneN, float3 u, float3 v, float capRadius,
-            ref ContactPoint outCp,
-            float3 normal, float depth)
+            float3 aAxis, float3 bAxis,
+            ref float3 mtvAxis,
+            ref float mtvDepth)
         {
-            // Ensure seed stays on the cap disk of the owner (capSeed is itself the disk center in this usage)
-            // We’ll just clamp it to the disk, then use midpoint of cylinder clamps.
-            float3 p = ClampToDisk(capSeed, capSeed, capRadius, u, v);
-            EmitMidpointWitness(in a, in b, p, normal, depth, ref outCp);
-        }
+            ProjectCylinderInterval(in a, aAxis, n, out float aMin, out float aMax);
+            ProjectCylinderInterval(in b, bAxis, n, out float bMin, out float bMax);
 
-        // ------------------------------------------------------------
-        // Disk intersection helpers (same plane)
-        // ------------------------------------------------------------
-        private static float3 ClosestPointInDiskIntersection(
-            float3 cA, float rA,
-            float3 cB, float rB,
-            float3 u, float3 v)
-        {
-            float3 p = 0.5f * (cA + cB);
-            for (int i = 0; i < 3; i++)
+            float overlap = math.min(aMax, bMax) - math.max(aMin, bMin);
+
+            if (overlap <= kSlop)
+                return false;
+
+            if (overlap < mtvDepth)
             {
-                p = ClampToDisk(p, cA, rA, u, v);
-                p = ClampToDisk(p, cB, rB, u, v);
+                mtvDepth = overlap;
+                mtvAxis = n;
             }
-            return p;
+
+            return true;
         }
 
-        private static float3 ClampPointToDiskIntersection(
+        private static void ProjectCylinderInterval(
+            in Cylinder cyl, float3 cylAxis, float3 n,
+            out float min, out float max)
+        {
+            float c = math.dot(cyl.center, n);
+
+            float a = math.abs(math.dot(cylAxis, n));
+            float radial = math.sqrt(math.max(0f, 1f - a * a));
+
+            float extent = cyl.halfHeight * a + cyl.radius * radial;
+
+            min = c - extent;
+            max = c + extent;
+        }
+
+        // ------------------------------------------------------------
+        // CAP-CAP manifold (FACE-FACE)
+        // ------------------------------------------------------------
+        // Inputs:
+        //  - n : unit normal pointing A -> B (axial-ish)
+        //  - depth : penetration depth along n (from your narrowphase)
+        // Behavior:
+        //  - Picks the facing cap of A and facing cap of B
+        //  - Builds intersection of their disks in the cap plane
+        //  - Emits up to 4 points ON RIMS, equally distributed (0/90/180/270)
+        //  - Points lie on the mid-plane between the two cap planes (stable shared plane)
+        public static bool BuildCapCapManifold(
+            in Cylinder a, in Cylinder b,
+            float3 aAxisW, float3 bAxisW,
+            float3 n, float depth,
+            out CylinderCylinderContactPoints cc)
+        {
+            cc = default;
+
+            if (depth <= kSlop)
+                return false;
+
+            // Choose facing caps (toward each other along n)
+            float aCapSign = (math.dot(aAxisW, n) >= 0f) ? +1f : -1f; // +1 => top cap, -1 => bottom cap
+            float bCapSign = (math.dot(bAxisW, n) >= 0f) ? -1f : +1f; // B faces opposite direction
+
+            float3 aCapCenter = a.center + aAxisW * (aCapSign * a.halfHeight);
+            float3 bCapCenter = b.center + bAxisW * (bCapSign * b.halfHeight);
+
+            // Build a stable plane basis (u,v) orthonormal to n
+            float3 u = AnyPerp(n);
+            float3 v = math.normalize(math.cross(n, u));
+
+            // Project bCapCenter into A's cap plane along n so both disks live in same plane coords
+            float3 bCenterProj = bCapCenter - n * math.dot(bCapCenter - aCapCenter, n);
+
+            // Compute circle-circle intersection in that plane (2D in u,v coordinates)
+            // We work in 2D:
+            //   A at (0,0), radius rA
+            //   B at (d,0) after aligning x axis to (bCenterProj-aCapCenter)
+            float2 b2 = ToPlane2D(bCenterProj - aCapCenter, u, v);
+            float d = math.length(b2);
+
+            float rA = a.radius;
+            float rB = b.radius;
+
+            // No overlap => no manifold (shouldn't happen if narrowphase said cap-cap)
+            if (d > rA + rB + 1e-6f)
+                return false;
+
+            // If coincident centers (d ~ 0): intersection is full disk of min radius.
+            // Your rule: points on rims (use min radius rim).
+            if (d < 1e-6f)
+            {
+                float r = math.min(rA, rB);
+
+                // Use 4 rim points in u/v directions
+                EmitCapCapPoint(in a, in b, aCapCenter, bCapCenter, n, depth, u * r, out cc.p1);
+                EmitCapCapPoint(in a, in b, aCapCenter, bCapCenter, n, depth, v * r, out cc.p2);
+                EmitCapCapPoint(in a, in b, aCapCenter, bCapCenter, n, depth, -u * r, out cc.p3);
+                EmitCapCapPoint(in a, in b, aCapCenter, bCapCenter, n, depth, -v * r, out cc.p4);
+
+                cc.numContactPoints = 4;
+                cc.globalPenAxis = n;
+                cc.globalPenDepth = depth;
+
+                DedupAndCompact(ref cc);
+                return cc.numContactPoints > 0;
+            }
+
+            // Align x-axis with B center direction in plane
+            float2 ex2 = b2 / d;              // 2D unit
+            float2 ey2 = new float2(-ex2.y, ex2.x);
+
+            // Circle-circle intersection:
+            // x = (d^2 + rA^2 - rB^2) / (2d)
+            // y = sqrt(rA^2 - x^2)
+            float x = (d * d + rA * rA - rB * rB) / (2f * d);
+            float y2 = rA * rA - x * x;
+            float y = (y2 > 0f) ? math.sqrt(y2) : 0f;
+
+            // Intersection chord endpoints in 2D (in A-centered plane coords)
+            float2 pI0_2 = ex2 * x + ey2 * y;
+            float2 pI1_2 = ex2 * x - ey2 * y;
+
+            // If y==0 -> tangent: only one intersection point.
+            // But you want up to 4 points on rims within overlap: for tangent, it's basically 1 point.
+            // We'll still generate 2 opposite points but clamp will collapse/dedup.
+            // Convert endpoints back to 3D points on the plane
+            float3 pI0 = aCapCenter + u * pI0_2.x + v * pI0_2.y;
+            float3 pI1 = aCapCenter + u * pI1_2.x + v * pI1_2.y;
+
+            // Now we need FOUR points "equally distributed" on the overlap region's rim.
+            // A robust way:
+            //  - pick a center inside the lens (midpoint of the two circle centers, clamped)
+            //  - choose 4 directions (u,v,-u,-v)
+            //  - cast each ray from lens center to the boundary of the intersection (clamp to both disks),
+            //    then force to rim(s) by pushing to circle boundary and re-clamping.
+            float3 lensCenter = ClosestPointInDiskIntersection_OnPlane(aCapCenter, rA, bCenterProj, rB, u, v);
+
+            // Directions in plane
+            float3 d0 = u;
+            float3 d1 = v;
+            float3 d2 = -u;
+            float3 d3 = -v;
+
+            // For "rim points", we try to land on boundary of intersection:
+            // Start by pushing far enough then clamp to intersection.
+            float rPush = math.min(rA, rB) * 2f;
+
+            float3 s0 = ClampPointToDiskIntersection_OnPlane(lensCenter + d0 * rPush, aCapCenter, rA, bCenterProj, rB, u, v);
+            float3 s1 = ClampPointToDiskIntersection_OnPlane(lensCenter + d1 * rPush, aCapCenter, rA, bCenterProj, rB, u, v);
+            float3 s2 = ClampPointToDiskIntersection_OnPlane(lensCenter + d2 * rPush, aCapCenter, rA, bCenterProj, rB, u, v);
+            float3 s3 = ClampPointToDiskIntersection_OnPlane(lensCenter + d3 * rPush, aCapCenter, rA, bCenterProj, rB, u, v);
+
+            // Force them to be on "a rim": push each to nearest circle boundary (A or B) while staying in intersection
+            s0 = ForceToRimAndClamp(s0, aCapCenter, rA, bCenterProj, rB, u, v);
+            s1 = ForceToRimAndClamp(s1, aCapCenter, rA, bCenterProj, rB, u, v);
+            s2 = ForceToRimAndClamp(s2, aCapCenter, rA, bCenterProj, rB, u, v);
+            s3 = ForceToRimAndClamp(s3, aCapCenter, rA, bCenterProj, rB, u, v);
+
+            int count = 0;
+            if (EmitCapCapSharedPoint(in a, in b, aCapCenter, bCapCenter, n, depth, s0, out var c0)) Write(ref cc, count++, c0);
+            if (EmitCapCapSharedPoint(in a, in b, aCapCenter, bCapCenter, n, depth, s1, out var c1)) Write(ref cc, count++, c1);
+            if (EmitCapCapSharedPoint(in a, in b, aCapCenter, bCapCenter, n, depth, s2, out var c2)) Write(ref cc, count++, c2);
+            if (EmitCapCapSharedPoint(in a, in b, aCapCenter, bCapCenter, n, depth, s3, out var c3)) Write(ref cc, count++, c3);
+
+            if (count == 0)
+                return false;
+
+            cc.numContactPoints = count;
+            cc.globalPenAxis = n;
+
+            // Use depth (or min per-contact depth if you compute it). For face-face, depth is uniform from narrowphase.
+            cc.globalPenDepth = depth;
+
+            DedupAndCompact(ref cc);
+            return cc.numContactPoints > 0;
+        }
+
+        // Emits a stable shared point on the mid-plane between caps (not biased to either cap plane).
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool EmitCapCapSharedPoint(
+            in Cylinder a, in Cylinder b,
+            float3 aCapCenter, float3 bCapCenter,
+            float3 n, float depth,
+            float3 planePoint,
+            out ContactPoint cp)
+        {
+            cp = default;
+
+            // Clamp to A cap disk (world)
+            float3 wA = ClosestPointOnCapDiskToPointWorld(in a, aCapCenter, n, planePoint);
+
+            // Clamp to B cap disk (world) - note: its cap plane normal is also n (caps are parallel-ish in cap-cap case)
+            float3 wB = ClosestPointOnCapDiskToPointWorld(in b, bCapCenter, n, planePoint);
+
+            // Shared point as midpoint (stable)
+            cp.point = 0.5f * (wA + wB);
+            cp.normal = n;
+            cp.depth = depth;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void EmitCapCapPoint(
+            in Cylinder a, in Cylinder b,
+            float3 aCapCenter, float3 bCapCenter,
+            float3 n, float depth,
+            float3 offsetOnPlane,
+            out ContactPoint cp)
+        {
+            float3 p = aCapCenter + offsetOnPlane;
+            EmitCapCapSharedPoint(in a, in b, aCapCenter, bCapCenter, n, depth, p, out cp);
+        }
+
+        // Clamp a point to the disk of a cap (defined by capCenter and plane normal n)
+        // This does NOT choose top/bottom; caller already selected capCenter.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 ClosestPointOnCapDiskToPointWorld(in Cylinder cyl, float3 capCenterW, float3 n, float3 pWorld)
+        {
+            // Build a basis for the cap plane
+            float3 u = AnyPerp(n);
+            float3 v = math.normalize(math.cross(n, u));
+
+            // Bring point into plane coords relative to cap center
+            float3 d = pWorld - capCenterW;
+            float2 d2 = new float2(math.dot(d, u), math.dot(d, v));
+
+            float lenSq = math.dot(d2, d2);
+            float r = cyl.radius;
+            float r2 = r * r;
+
+            float2 clamped;
+            if (lenSq <= 1e-20f)
+            {
+                clamped = new float2(r, 0f); // arbitrary rim direction if exactly at center
+            }
+            else if (lenSq <= r2)
+            {
+                clamped = d2;
+            }
+            else
+            {
+                float invLen = math.rsqrt(lenSq);
+                clamped = d2 * (r * invLen);
+            }
+
+            // Return on the cap plane (same plane as capCenterW)
+            return capCenterW + u * clamped.x + v * clamped.y;
+        }
+
+        // Force a point to the boundary of either disk, then clamp back into intersection.
+        // This yields "rim points" that stay inside the overlap lens.
+        private static float3 ForceToRimAndClamp(
             float3 p,
             float3 cA, float rA,
             float3 cB, float rB,
             float3 u, float3 v)
         {
-            p = ClampToDisk(p, cA, rA, u, v);
-            p = ClampToDisk(p, cB, rB, u, v);
-            p = ClampToDisk(p, cA, rA, u, v);
+            // Determine which circle boundary is closer to being "outside" (push to that rim)
+            float2 a2 = ToPlane2D(p - cA, u, v);
+            float2 b2 = ToPlane2D(p - cB, u, v);
+
+            float da = math.length(a2);
+            float db = math.length(b2);
+
+            float3 q = p;
+
+            // Push to A rim
+            if (da >= db)
+            {
+                float2 dir = (da > 1e-12f) ? (a2 / da) : new float2(1, 0);
+                q = cA + u * (dir.x * rA) + v * (dir.y * rA);
+            }
+            else
+            {
+                float2 dir = (db > 1e-12f) ? (b2 / db) : new float2(1, 0);
+                q = cB + u * (dir.x * rB) + v * (dir.y * rB);
+            }
+
+            // Clamp back into lens
+            q = ClampPointToDiskIntersection_OnPlane(q, cA, rA, cB, rB, u, v);
+            return q;
+        }
+
+        // ------------------------------------------------------------
+        // Disk intersection helpers (in the plane spanned by u,v)
+        // ------------------------------------------------------------
+        private static float3 ClosestPointInDiskIntersection_OnPlane(
+            float3 cA, float rA,
+            float3 cB, float rB,
+            float3 u, float3 v)
+        {
+            // Start at midpoint of centers and iteratively clamp to both disks
+            float3 p = 0.5f * (cA + cB);
+            for (int i = 0; i < 4; i++)
+            {
+                p = ClampToDisk_OnPlane(p, cA, rA, u, v);
+                p = ClampToDisk_OnPlane(p, cB, rB, u, v);
+            }
             return p;
         }
 
-        private static float3 ClampToDisk(float3 p, float3 c, float r, float3 u, float3 v)
+        private static float3 ClampPointToDiskIntersection_OnPlane(
+            float3 p,
+            float3 cA, float rA,
+            float3 cB, float rB,
+            float3 u, float3 v)
         {
-            float2 d2 = new float2(math.dot(p - c, u), math.dot(p - c, v));
+            p = ClampToDisk_OnPlane(p, cA, rA, u, v);
+            p = ClampToDisk_OnPlane(p, cB, rB, u, v);
+            p = ClampToDisk_OnPlane(p, cA, rA, u, v);
+            return p;
+        }
+
+        private static float3 ClampToDisk_OnPlane(float3 p, float3 c, float r, float3 u, float3 v)
+        {
+            float2 d2 = ToPlane2D(p - c, u, v);
             float lenSq = math.dot(d2, d2);
             float r2 = r * r;
-            if (lenSq <= r2) return p;
+
+            if (lenSq <= r2)
+                return p;
 
             float invLen = math.rsqrt(math.max(lenSq, 1e-20f));
             float2 dN = d2 * invLen;
             return c + u * (dN.x * r) + v * (dN.y * r);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float2 ToPlane2D(float3 d, float3 u, float3 v)
+        {
+            return new float2(math.dot(d, u), math.dot(d, v));
+        }
+
         // ------------------------------------------------------------
-        // Geometry helpers
+        // Utility
         // ------------------------------------------------------------
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float3 GetAxis(in Cylinder c)
         {
-            return math.normalize(math.rotate(c.rot, math.up())); // local +Y
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void GetSegment(in Cylinder c, float3 axis, out float3 A, out float3 B)
-        {
-            float3 h = axis * c.halfHeight;
-            A = c.center - h;
-            B = c.center + h;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float3 StableNormalFromAxes(float3 aAxis, float3 bAxis)
-        {
-            float3 cross = math.cross(aAxis, bAxis);
-            if (math.lengthsq(cross) > kEpsLenSq)
-                return math.normalize(math.cross(cross, aAxis));
-            return AnyPerp(aAxis);
+            return math.normalize(math.rotate(c.rot, math.up()));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -433,109 +522,56 @@ namespace Shard.Dev
             return p * math.rsqrt(lenSq);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float3 ClosestPointOnSegment(float3 a, float3 b, float3 p)
+        private static void DedupAndCompact(ref CylinderCylinderContactPoints cc)
         {
-            float3 ab = b - a;
-            float t = math.dot(p - a, ab) / math.max(math.dot(ab, ab), 1e-20f);
-            t = math.clamp(t, 0f, 1f);
-            return a + ab * t;
-        }
+            Span<ContactPoint> tmp = stackalloc ContactPoint[4];
+            int count = 0;
 
-        // Closest points between segments (also returns params)
-        private static void ClosestPointsSegmentSegment(
-            float3 p1, float3 q1,
-            float3 p2, float3 q2,
-            out float s, out float t,
-            out float3 c1, out float3 c2)
-        {
-            float3 d1 = q1 - p1;
-            float3 d2 = q2 - p2;
-            float3 r = p1 - p2;
+            if (cc.p1.depth >= 0f) tmp[count++] = cc.p1;
+            if (cc.p2.depth >= 0f) tmp[count++] = cc.p2;
+            if (cc.p3.depth >= 0f) tmp[count++] = cc.p3;
+            if (cc.p4.depth >= 0f) tmp[count++] = cc.p4;
 
-            float a = math.dot(d1, d1);
-            float e = math.dot(d2, d2);
-            float f = math.dot(d2, r);
+            Span<ContactPoint> outPts = stackalloc ContactPoint[4];
+            int outCount = 0;
 
-            if (a <= 1e-12f && e <= 1e-12f)
+            for (int i = 0; i < count; i++)
             {
-                s = t = 0f;
-                c1 = p1;
-                c2 = p2;
-                return;
-            }
-
-            if (a <= 1e-12f)
-            {
-                s = 0f;
-                t = math.clamp(f / e, 0f, 1f);
-            }
-            else
-            {
-                float c = math.dot(d1, r);
-                if (e <= 1e-12f)
+                bool dup = false;
+                for (int j = 0; j < outCount; j++)
                 {
-                    t = 0f;
-                    s = math.clamp(-c / a, 0f, 1f);
-                }
-                else
-                {
-                    float b = math.dot(d1, d2);
-                    float denom = a * e - b * b;
-
-                    if (math.abs(denom) > 1e-12f)
-                        s = math.clamp((b * f - c * e) / denom, 0f, 1f);
-                    else
-                        s = 0f;
-
-                    float tNom = b * s + f;
-                    if (tNom < 0f)
+                    if (math.lengthsq(outPts[j].point - tmp[i].point) <= kDedupEpsSq)
                     {
-                        t = 0f;
-                        s = math.clamp(-c / a, 0f, 1f);
-                    }
-                    else if (tNom > e)
-                    {
-                        t = 1f;
-                        s = math.clamp((b - c) / a, 0f, 1f);
-                    }
-                    else
-                    {
-                        t = tNom / e;
+                        dup = true;
+                        break;
                     }
                 }
+
+                if (!dup)
+                    outPts[outCount++] = tmp[i];
             }
 
-            c1 = p1 + d1 * s;
-            c2 = p2 + d2 * t;
+            var axis = cc.globalPenAxis;
+            var depth = cc.globalPenDepth;
+
+            cc = default;
+            if (outCount > 0) cc.p1 = outPts[0];
+            if (outCount > 1) cc.p2 = outPts[1];
+            if (outCount > 2) cc.p3 = outPts[2];
+            if (outCount > 3) cc.p4 = outPts[3];
+            cc.numContactPoints = outCount;
+
+            cc.globalPenAxis = axis;
+            cc.globalPenDepth = depth;
         }
 
-        // Clamp-to-cylinder-volume point (world) – matches your cylinder-box helper behavior
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static float3 ClosestPointOnCylinderToPointWorld(in Cylinder cyl, float3 pWorld)
+        private static void Write(ref CylinderCylinderContactPoints cc, int index, ContactPoint cp)
         {
-            float3 pL = math.rotate(math.inverse(cyl.rot), pWorld - cyl.center);
-
-            float y = math.clamp(pL.y, -cyl.halfHeight, cyl.halfHeight);
-
-            float2 xz = new float2(pL.x, pL.z);
-            float lenSq = math.lengthsq(xz);
-            float r = cyl.radius;
-
-            float2 xzClamped;
-            if (lenSq <= 1e-12f)
-            {
-                xzClamped = new float2(r, 0f);
-            }
-            else
-            {
-                float len = math.sqrt(lenSq);
-                float s = math.min(1f, r / len);
-                xzClamped = xz * s;
-            }
-
-            float3 qL = new float3(xzClamped.x, y, xzClamped.y);
-            return cyl.center + math.rotate(cyl.rot, qL);
+            if (index == 0) cc.p1 = cp;
+            else if (index == 1) cc.p2 = cp;
+            else if (index == 2) cc.p3 = cp;
+            else if (index == 3) cc.p4 = cp;
         }
     }
 }

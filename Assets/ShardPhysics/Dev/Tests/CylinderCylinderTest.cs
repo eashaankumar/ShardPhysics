@@ -1,3 +1,5 @@
+using Unity.Mathematics;
+using UnityEditor;
 using UnityEngine;
 
 namespace Shard.Dev.Tests
@@ -29,6 +31,17 @@ namespace Shard.Dev.Tests
                     DrawContactPoint(i);
                 }
             }
+
+            DrawCylinder(GetCylinder(cyl1Trans));
+            DrawCylinder(GetCylinder(cyl2Trans));
+        }
+
+        void DrawCylinder(CylinderCylinderSolver.Cylinder cyl)
+        {
+            Handles.matrix = Matrix4x4.identity;
+            Handles.color = Color.yellow;
+            float3 up = math.rotate(cyl.rot, math.up());
+            Handles.DrawWireDisc(cyl.center + up * cyl.halfHeight, up, cyl.radius);
         }
 
         void DrawContactPoint(int i)
