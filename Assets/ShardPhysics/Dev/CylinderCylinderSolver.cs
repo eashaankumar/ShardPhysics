@@ -333,10 +333,15 @@ namespace Shard.Dev
             // If CAP is A and SIDE is B, then A->B is opposite that.
             float3 nAB = aIsCap ? -aAxisW : -bAxisW;
 
+            // Make depth consistent with the axis you are returning
+            float depthAB = math.dot((wSide - wCap), nAB);   // should be positive
+            if (depthAB <= kSlop) depthAB = penDepth;        // fallback
+
+
             ContactPoint cp;
             cp.point = wSide;
             cp.normal = nAB;
-            cp.depth = penDepth;
+            cp.depth = depthAB;
 
             Write(ref cc, 0, cp);
             cc.numContactPoints = 1;
@@ -344,7 +349,7 @@ namespace Shard.Dev
             // For cap-side, global penetration axis/depth should match the actual side radial,
             // not the cap normal / SAT MTV.
             cc.globalPenAxis = nAB;
-            cc.globalPenDepth = penDepth;
+            cc.globalPenDepth = depthAB;
 
             DedupAndCompact(ref cc);
             return cc.numContactPoints > 0;

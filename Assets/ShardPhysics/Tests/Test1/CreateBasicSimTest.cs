@@ -135,16 +135,6 @@ namespace Shard.Tests.Test1
 
                 world.Simulate(dt);
 
-                //hit = CylinderBoxSolver.Solve(new CylinderBoxSolver.Box(boxTrans.position, boxTrans.rotation, boxTrans.localScale / 2),
-                //                    new CylinderBoxSolver.Cylinder(cylinderTrans.position, cylinderTrans.rotation, cylinderTrans.localScale.y / 2, cylinderTrans.localScale.x / 2),
-                //                    out cps);
-
-                //if (hit)
-                //{
-                //    Debug.Log("Cylinder box hit! " + Time.time);
-                //}
-                //print(hit);
-
                 UpdatePose(box1, box1Trans);
 
                 UpdatePose(box2, box2Trans);
