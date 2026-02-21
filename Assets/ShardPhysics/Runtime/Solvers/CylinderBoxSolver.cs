@@ -380,7 +380,25 @@ namespace Shard.Runtime.Solvers
             float faceHalf = GetHalf(box.halfExtents, faceAxis);
             float3 faceCenter = box.center + faceN * faceHalf;
 
-            // Compute one deepest point on the cylinder side at each end (t = +/- halfHeight)
+            // In-plane basis + half extents for clamping to face rectangle
+            int uI = (faceAxis + 1) % 3;
+            int vI = (faceAxis + 2) % 3;
+            float3 u = boxAx[uI];
+            float3 v = boxAx[vI];
+            float uHalf = GetHalf(box.halfExtents, uI);
+            float vHalf = GetHalf(box.halfExtents, vI);
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            float3 ClampToFaceRect(float3 pOnPlane)
+            {
+                float du = math.dot(pOnPlane - faceCenter, u);
+                float dv = math.dot(pOnPlane - faceCenter, v);
+                du = math.clamp(du, -uHalf, uHalf);
+                dv = math.clamp(dv, -vHalf, vHalf);
+                return faceCenter + u * du + v * dv;
+            }
+
+            // Deepest point on the cylinder side at each end (t = +/- halfHeight)
             float3 cylP0 = DeepestSidePointAtAxisOffset(in cyl, cylAxis, -cyl.halfHeight, faceN);
             float3 cylP1 = DeepestSidePointAtAxisOffset(in cyl, cylAxis, +cyl.halfHeight, faceN);
 
@@ -393,23 +411,33 @@ namespace Shard.Runtime.Solvers
             bool pen0 = d0 <= planePenEps;
             bool pen1 = d1 <= planePenEps;
 
-            // Project cylinder witness points onto the box face plane (stable contact point on box)
+            // Project cylinder witness points onto the face plane
             float3 onPlane0 = cylP0 - faceN * d0;
             float3 onPlane1 = cylP1 - faceN * d1;
+
+            // NEW: clamp to the finite face rectangle (fixes hanging-off-edge)
+            onPlane0 = ClampToFaceRect(onPlane0);
+            onPlane1 = ClampToFaceRect(onPlane1);
+
+            // NEW: re-witness against cylinder for a "contained-ish" stable point
+            float3 s0 = ClosestPointOnCylinderToPointWorld(in cyl, onPlane0);
+            float3 s1 = ClosestPointOnCylinderToPointWorld(in cyl, onPlane1);
+            float3 c0 = 0.5f * (onPlane0 + s0);
+            float3 c1 = 0.5f * (onPlane1 + s1);
 
             // If both ends penetrate => 2-point manifold (supports along the side)
             if (pen0 && pen1)
             {
                 // De-dupe in case halfHeight ~ 0 or extreme degeneracy
-                if (math.lengthsq(onPlane1 - onPlane0) <= 1e-8f)
+                if (math.lengthsq(c1 - c0) <= 1e-8f)
                 {
-                    WriteContact(ref cbcp.p1, onPlane0, globalN, globalDepth);
+                    WriteContact(ref cbcp.p1, c0, globalN, globalDepth);
                     cbcp.numContactPoints = 1;
                     return;
                 }
 
-                WriteContact(ref cbcp.p1, onPlane0, globalN, globalDepth);
-                WriteContact(ref cbcp.p2, onPlane1, globalN, globalDepth);
+                WriteContact(ref cbcp.p1, c0, globalN, globalDepth);
+                WriteContact(ref cbcp.p2, c1, globalN, globalDepth);
                 cbcp.numContactPoints = 2;
                 return;
             }
@@ -417,16 +445,13 @@ namespace Shard.Runtime.Solvers
             // Otherwise emit ONLY ONE: the deeper of the two (most negative distance)
             // If only one penetrates, this automatically picks it.
             if (d1 < d0)
-            {
-                WriteContact(ref cbcp.p1, onPlane1, globalN, globalDepth);
-                cbcp.numContactPoints = 1;
-            }
+                WriteContact(ref cbcp.p1, c1, globalN, globalDepth);
             else
-            {
-                WriteContact(ref cbcp.p1, onPlane0, globalN, globalDepth);
-                cbcp.numContactPoints = 1;
-            }
+                WriteContact(ref cbcp.p1, c0, globalN, globalDepth);
+
+            cbcp.numContactPoints = 1;
         }
+
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float3 DeepestSidePointAtAxisOffset(
