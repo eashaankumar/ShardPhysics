@@ -70,8 +70,21 @@ namespace Shard.Dev
             float3 bAxis = GetAxis(in b);
 
             // SAT gives reliable overlap test + an MTV over the candidate set.
+            // SAT gives reliable overlap test + an MTV over the candidate set.
             if (!SAT_CylinderCylinder(in a, in b, aAxis, bAxis, out float3 n, out float depth))
                 return false;
+
+            // Orient A->B
+
+            if (depth <= kSlop)
+                return false;
+
+            cc.globalPenAxis = n;
+            cc.globalPenDepth = depth;
+
+            // Orient A->B early (important for choosing facing caps)
+            float3 cTo = b.center - a.center;
+            if (math.dot(n, cTo) < 0f) n = -n;
 
             float axesDot = math.abs(math.dot(aAxis, bAxis));
             bool axesParallel = axesDot > 0.9995f;
@@ -80,6 +93,23 @@ namespace Shard.Dev
             bool sideNormal =
                 math.abs(math.dot(n, aAxis)) < 0.2f &&
                 math.abs(math.dot(n, bAxis)) < 0.2f;
+
+            // cap normal means n mostly aligned with both axes
+            bool capNormal =
+                math.abs(math.dot(n, aAxis)) > 0.9f &&
+                math.abs(math.dot(n, bAxis)) > 0.9f;
+
+            // ✅ CAP-CAP PARALLEL: 4 points on the shared mid-plane, clipped to disk∩disk
+            if (axesParallel && capNormal)
+            {
+                if (BuildCapCapParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc))
+                {
+                    DedupAndCompact(ref cc);
+                    cc.globalPenAxis = n;
+                    cc.globalPenDepth = depth;
+                    return cc.numContactPoints > 0;
+                }
+            }
 
             if (axesParallel && sideNormal)
             {
@@ -92,16 +122,6 @@ namespace Shard.Dev
                 }
             }
 
-            // Orient A->B
-            float3 cTo = b.center - a.center;
-            if (math.dot(n, cTo) < 0f) n = -n;
-
-            if (depth <= kSlop)
-                return false;
-
-            cc.globalPenAxis = n;
-            cc.globalPenDepth = depth;
-
             // Bepu-style: build manifold in contact plane via support probing + reduction.
             BuildManifold_ConvexStyle(in a, in b, aAxis, bAxis, n, depth, ref cc);
 
@@ -113,6 +133,184 @@ namespace Shard.Dev
 
             return cc.numContactPoints > 0;
         }
+
+        private static bool BuildCapCapParallelManifold(
+    in Cylinder a, in Cylinder b,
+    float3 aAxis, float3 bAxis,
+    float3 nAB, float depth,
+    ref CylinderCylinderContactPoints cc)
+        {
+            if (depth <= kSlop)
+                return false;
+
+            // Pick facing caps (toward each other along nAB)
+            // A faces +nAB, B faces -nAB
+            float aSign = (math.dot(aAxis, nAB) >= 0f) ? +1f : -1f;
+            float bSign = (math.dot(bAxis, nAB) >= 0f) ? -1f : +1f;
+
+            float3 aCapC = a.center + aAxis * (aSign * a.halfHeight);
+            float3 bCapC = b.center + bAxis * (bSign * b.halfHeight);
+
+            // Build stable plane basis (u,v) orthonormal to nAB
+            BuildStableOrthoBasis(nAB, out float3 u, out float3 v);
+
+            // Project B cap center into A cap plane along nAB so both disks live in same plane
+            float3 bCproj = bCapC - nAB * math.dot(bCapC - aCapC, nAB);
+
+            float rA = a.radius;
+            float rB = b.radius;
+
+            // Mid-plane between the two cap planes (your "intersecting plane")
+            float planeOffset = 0.5f * math.dot(bCapC - aCapC, nAB);
+            float3 midPlaneOrigin = aCapC + nAB * planeOffset;
+
+            // Find a point inside the lens (disk ∩ disk) in that plane
+            float3 lensCenter = ClosestPointInDiskIntersection_OnPlane(aCapC, rA, bCproj, rB, u, v);
+
+            // If there is no intersection, no cap-cap manifold (shouldn't happen if SAT classified cap-cap)
+            if (!PointInBothDisks_OnPlane(lensCenter, aCapC, rA, bCproj, rB, u, v))
+                return false;
+
+            // Emit 4 clipped points around lensCenter in u/v directions
+            const float push = 2f; // push factor (scaled by min radius)
+            float big = math.min(rA, rB) * push;
+
+            float3 p0 = ClipToDiskIntersection_OnPlane(lensCenter + u * big, aCapC, rA, bCproj, rB, u, v);
+            float3 p1 = ClipToDiskIntersection_OnPlane(lensCenter + v * big, aCapC, rA, bCproj, rB, u, v);
+            float3 p2 = ClipToDiskIntersection_OnPlane(lensCenter - u * big, aCapC, rA, bCproj, rB, u, v);
+            float3 p3 = ClipToDiskIntersection_OnPlane(lensCenter - v * big, aCapC, rA, bCproj, rB, u, v);
+
+            // Force to rim-ish while staying in lens (prevents drifting inward)
+            p0 = ForceToRimAndClip(p0, aCapC, rA, bCproj, rB, u, v);
+            p1 = ForceToRimAndClip(p1, aCapC, rA, bCproj, rB, u, v);
+            p2 = ForceToRimAndClip(p2, aCapC, rA, bCproj, rB, u, v);
+            p3 = ForceToRimAndClip(p3, aCapC, rA, bCproj, rB, u, v);
+
+            // Convert each plane point to the shared MID-PLANE (same u/v, mid between caps)
+            // This ensures "clipped onto the intersecting plane".
+            p0 = ToMidPlane(p0, aCapC, midPlaneOrigin, nAB);
+            p1 = ToMidPlane(p1, aCapC, midPlaneOrigin, nAB);
+            p2 = ToMidPlane(p2, aCapC, midPlaneOrigin, nAB);
+            p3 = ToMidPlane(p3, aCapC, midPlaneOrigin, nAB);
+
+            // Write 4 contacts
+            cc = default;
+            InvalidateAll(ref cc);
+
+            int count = 0;
+            Write(ref cc, count++, MakeCP(p0, nAB, depth));
+            Write(ref cc, count++, MakeCP(p1, nAB, depth));
+            Write(ref cc, count++, MakeCP(p2, nAB, depth));
+            Write(ref cc, count++, MakeCP(p3, nAB, depth));
+
+            cc.numContactPoints = count;
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = depth;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ContactPoint MakeCP(float3 p, float3 n, float depth)
+        {
+            ContactPoint cp;
+            cp.point = p;
+            cp.normal = n;
+            cp.depth = depth;
+            return cp;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 ToMidPlane(float3 pOnACapPlane, float3 aCapC, float3 midPlaneOrigin, float3 nAB)
+        {
+            // Remove any numerical normal component relative to A cap plane, keep u/v offset,
+            // then re-add it to midPlaneOrigin.
+            float3 d = pOnACapPlane - aCapC;
+            d -= nAB * math.dot(d, nAB);
+            return midPlaneOrigin + d;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool PointInBothDisks_OnPlane(
+            float3 p, float3 cA, float rA, float3 cB, float rB, float3 u, float3 v)
+        {
+            float2 a2 = ToPlane2D(p - cA, u, v);
+            float2 b2 = ToPlane2D(p - cB, u, v);
+            return math.dot(a2, a2) <= rA * rA + 1e-8f && math.dot(b2, b2) <= rB * rB + 1e-8f;
+        }
+
+        private static float3 ClosestPointInDiskIntersection_OnPlane(
+            float3 cA, float rA, float3 cB, float rB, float3 u, float3 v)
+        {
+            // Iterative clamp between disks
+            float3 p = 0.5f * (cA + cB);
+            for (int i = 0; i < 6; i++)
+            {
+                p = ClampToDisk_OnPlane(p, cA, rA, u, v);
+                p = ClampToDisk_OnPlane(p, cB, rB, u, v);
+            }
+            return p;
+        }
+
+        private static float3 ClipToDiskIntersection_OnPlane(
+            float3 p, float3 cA, float rA, float3 cB, float rB, float3 u, float3 v)
+        {
+            // Alternate clamp a few times to get into lens
+            for (int i = 0; i < 4; i++)
+            {
+                p = ClampToDisk_OnPlane(p, cA, rA, u, v);
+                p = ClampToDisk_OnPlane(p, cB, rB, u, v);
+            }
+            p = ClampToDisk_OnPlane(p, cA, rA, u, v);
+            return p;
+        }
+
+        private static float3 ForceToRimAndClip(
+            float3 p, float3 cA, float rA, float3 cB, float rB, float3 u, float3 v)
+        {
+            float2 a2 = ToPlane2D(p - cA, u, v);
+            float2 b2 = ToPlane2D(p - cB, u, v);
+
+            float da = math.length(a2);
+            float db = math.length(b2);
+
+            float3 q = p;
+
+            // Push toward the more "active" rim (whichever is closer to being outside)
+            if (da >= db)
+            {
+                float2 dir = (da > 1e-12f) ? (a2 / da) : new float2(1, 0);
+                q = cA + u * (dir.x * rA) + v * (dir.y * rA);
+            }
+            else
+            {
+                float2 dir = (db > 1e-12f) ? (b2 / db) : new float2(1, 0);
+                q = cB + u * (dir.x * rB) + v * (dir.y * rB);
+            }
+
+            // Then clip back into the lens
+            return ClipToDiskIntersection_OnPlane(q, cA, rA, cB, rB, u, v);
+        }
+
+        private static float3 ClampToDisk_OnPlane(float3 p, float3 c, float r, float3 u, float3 v)
+        {
+            float2 d2 = ToPlane2D(p - c, u, v);
+            float lenSq = math.dot(d2, d2);
+            float r2 = r * r;
+
+            if (lenSq <= r2)
+                return p;
+
+            float invLen = math.rsqrt(math.max(lenSq, 1e-20f));
+            float2 dN = d2 * invLen;
+            return c + u * (dN.x * r) + v * (dN.y * r);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float2 ToPlane2D(float3 d, float3 u, float3 v)
+        {
+            return new float2(math.dot(d, u), math.dot(d, v));
+        }
+
 
         private static bool BuildSideSideParallelManifold(
     in Cylinder a, in Cylinder b,
