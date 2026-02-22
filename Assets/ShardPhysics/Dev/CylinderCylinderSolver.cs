@@ -120,7 +120,6 @@ namespace Shard.Dev
             // ------------------------------------------------------------
             if (!built)
             {
-                Debug.Log("Cap side " + Time.time);
                 built = TryBuildCapSide_FromClosestPoints(in a, in b, aAxis, bAxis, n, depth, ref cc);
             }
 
@@ -129,11 +128,13 @@ namespace Shard.Dev
             // ------------------------------------------------------------
             if (!built)
             {
+                Debug.Log("Rim cap a b " + Time.time);
                 built = TryBuildEdgeCapRim(in a, in b, aAxis, bAxis, n, depth, ref cc);
             }
 
             if (!built)
             {
+                Debug.Log("Rim cap b a " + Time.time);
                 built = TryBuildEdgeCapRim(in b, in a, bAxis, aAxis, n, depth, ref cc);
             }
 
@@ -674,7 +675,6 @@ namespace Shard.Dev
             // Choose which rim of edgeCyl faces capCyl
             float sEdge = (math.dot(edgeAxis, nEdge) >= 0f) ? +1f : -1f;
             float3 edgeRimCenter = edgeCyl.center + edgeAxis * (sEdge * edgeCyl.halfHeight);
-            float3 edgeRimNormal = edgeAxis;
 
             // Choose which cap of capCyl faces edgeCyl (outward normal toward edge)
             float3 capToEdge = edgeCyl.center - capCyl.center;
@@ -682,135 +682,34 @@ namespace Shard.Dev
             float3 capCenter = capCyl.center + capAxis * (sCap * capCyl.halfHeight);
             float3 capNormalOut = capAxis * sCap;
 
-            // ------------------------------------------------------------
-            // 1) Deepest rim point relative to the cap plane
-            // ------------------------------------------------------------
-            float3 q = capNormalOut - edgeRimNormal * math.dot(capNormalOut, edgeRimNormal);
-            float qLenSq = math.lengthsq(q);
+            float3 intoCap = -capNormalOut;
 
-            if (qLenSq > 1e-12f)
+            // Rim plane basis
+            BuildStableOrthoBasis(edgeAxis, out float3 uE, out float3 vE);
+
+            // ------------------------------------------------------------
+            // 1) Unconstrained deepest rim point (maximize dot(p, intoCap))
+            // ------------------------------------------------------------
+            float3 dir = intoCap - edgeAxis * math.dot(intoCap, edgeAxis);
+            float dirLenSq = math.lengthsq(dir);
+            if (dirLenSq < 1e-20f)
             {
-                q *= math.rsqrt(qLenSq);
-
-                // Deepest rim point is opposite q (most negative plane distance)
-                float3 pDeep = edgeRimCenter - q * edgeCyl.radius;
-
-                if (ProjectsInsideCapDisk(pDeep, capCenter, capNormalOut, capCyl.radius))
-                {
-                    // --- emit from rim point, but choose a point that is inside BOTH ---
-                    float sd = math.dot(pDeep - capCenter, capNormalOut);
-                    float3 pCap = pDeep - capNormalOut * sd;
-                    float3 shared = 0.5f * (pDeep + pCap);
-
-                    float3 chosen = shared;
-
-                    if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, chosen))
-                    {
-                        if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pDeep))
-                            chosen = pDeep;
-                        else if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pCap))
-                            chosen = pCap;
-                        else
-                            goto STEP2; // no valid point from this candidate
-                    }
-
-                    cc = default;
-                    InvalidateAll(ref cc);
-
-                    ContactPoint cp;
-                    cp.point = chosen;
-                    cp.normal = nAB;
-                    cp.depth = satDepth;
-
-                    Write(ref cc, 0, cp);
-                    cc.numContactPoints = 1;
-                    cc.globalPenAxis = nAB;
-                    cc.globalPenDepth = satDepth;
-                    return true;
-                }
+                // intoCap parallel to rim normal -> pick stable in-plane axis
+                dir = uE;
+                dirLenSq = 1f;
             }
+            dir *= math.rsqrt(dirLenSq);
 
-        STEP2:
-            // ------------------------------------------------------------
-            // 2) Rim circle intersects cap plane -> pick a valid endpoint
-            // ------------------------------------------------------------
-            float3 lineDir = math.cross(edgeRimNormal, capNormalOut);
-            float lineDirLenSq = math.lengthsq(lineDir);
-            if (lineDirLenSq < 1e-12f)
-                return false;
+            float3 p0 = edgeRimCenter + dir * edgeCyl.radius;
 
-            float3 l = lineDir;
-            float lLenSq = lineDirLenSq;
-
-            float d0 = math.dot(edgeRimNormal, edgeRimCenter);
-            float d1 = math.dot(capNormalOut, capCenter);
-
-            float3 x0 =
-                (d0 * math.cross(capNormalOut, l) +
-                 d1 * math.cross(l, edgeRimNormal)) / lLenSq;
-
-            lineDir *= math.rsqrt(lineDirLenSq);
-
-            // Intersect line with rim circle
-            float3 m = x0 - edgeRimCenter;
-            float B = 2f * math.dot(lineDir, m);
-            float C = math.dot(m, m) - edgeCyl.radius * edgeCyl.radius;
-            float disc = B * B - 4f * C; // A=1
-
-            if (disc < 0f)
-                return false;
-
-            float sqrtDisc = math.sqrt(math.max(0f, disc));
-            float tA = (-B - sqrtDisc) * 0.5f;
-            float tB = (-B + sqrtDisc) * 0.5f;
-
-            float3 pA = x0 + lineDir * tA;
-            float3 pB = x0 + lineDir * tB;
-
-            bool okA = ProjectsInsideCapDisk(pA, capCenter, capNormalOut, capCyl.radius);
-            bool okB = ProjectsInsideCapDisk(pB, capCenter, capNormalOut, capCyl.radius);
-
-            if (!okA && !okB)
-                return false;
-
-            // Prefer endpoint with smallest signed distance (most "behind")
-            float bestSd = float.PositiveInfinity;
-            float3 bestP = default;
-
-            if (okA)
+            // If already valid, emit it
+            if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, p0))
             {
-                float sd = math.dot(pA - capCenter, capNormalOut);
-                if (sd < bestSd) { bestSd = sd; bestP = pA; }
-            }
-            if (okB)
-            {
-                float sd = math.dot(pB - capCenter, capNormalOut);
-                if (sd < bestSd) { bestSd = sd; bestP = pB; }
-            }
-
-            // --- emit from bestP, but choose a point that is inside BOTH ---
-            {
-                float sd = math.dot(bestP - capCenter, capNormalOut);
-                float3 pCap = bestP - capNormalOut * sd;
-                float3 shared = 0.5f * (bestP + pCap);
-
-                float3 chosen = shared;
-
-                if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, chosen))
-                {
-                    if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, bestP))
-                        chosen = bestP;
-                    else if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pCap))
-                        chosen = pCap;
-                    else
-                        return false;
-                }
-
                 cc = default;
                 InvalidateAll(ref cc);
 
                 ContactPoint cp;
-                cp.point = chosen;
+                cp.point = p0;
                 cp.normal = nAB;
                 cp.depth = satDepth;
 
@@ -820,8 +719,43 @@ namespace Shard.Dev
                 cc.globalPenDepth = satDepth;
                 return true;
             }
+
+            // ------------------------------------------------------------
+            // 2) One-shot correction (NO ITERATION):
+            // Clamp p0 into CAP volume, then re-project to the RIM circle.
+            // ------------------------------------------------------------
+            float3 q = ClampPointToFiniteCylinderVolume(in capCyl, capAxis, p0);
+
+            // project q onto rim plane, then clamp to rim circle
+            float3 qProj = q - edgeAxis * math.dot(q - edgeRimCenter, edgeAxis);
+            float3 d = qProj - edgeRimCenter;
+            float dsq = math.lengthsq(d);
+            if (dsq < 1e-20f)
+                return false; // can't form direction in rim plane
+
+            d *= math.rsqrt(dsq);
+            float3 p1 = edgeRimCenter + d * edgeCyl.radius;
+
+            if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, p1))
+                return false;
+
+            cc = default;
+            InvalidateAll(ref cc);
+
+            ContactPoint cp1;
+            cp1.point = p1;
+            cp1.normal = nAB;
+            cp1.depth = satDepth;
+
+            Write(ref cc, 0, cp1);
+            cc.numContactPoints = 1;
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = satDepth;
+            return true;
         }
 
+
+        #endregion
 
         #region Side-side non-perpendicular intersection
         private static bool TryBuildSideSideSkewSinglePoint(
@@ -968,7 +902,6 @@ namespace Shard.Dev
             pB = b0 + d2 * t;
         }
 
-        #endregion
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool EmitEdgeCapContactFromRimPoint(
