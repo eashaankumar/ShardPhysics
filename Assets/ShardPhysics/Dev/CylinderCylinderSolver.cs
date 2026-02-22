@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Runtime.CompilerServices;
 using Unity.Mathematics;
+using UnityEngine;
 
 namespace Shard.Dev
 {
@@ -102,6 +103,7 @@ namespace Shard.Dev
             // ---------------------------
             if (axesParallel && capNormal)
             {
+                Debug.Log("Cap cap");
                 if (BuildCapCapParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc))
                 {
                     DedupAndCompact(ref cc);
@@ -116,7 +118,26 @@ namespace Shard.Dev
             // ---------------------------
             if (axesParallel && sideNormal)
             {
+                Debug.Log("parallel side side");
                 if (BuildSideSideParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc))
+                {
+                    DedupAndCompact(ref cc);
+                    cc.globalPenAxis = n;
+                    cc.globalPenDepth = depth;
+                    return cc.numContactPoints > 0;
+                }
+            }
+
+            // ---------------------------
+            // 2.5) SKEW SIDE–SIDE (general non-parallel)
+            // Robust gate: closest points are interior on BOTH axes.
+            // Emits EXACTLY 1 contact.
+            // ---------------------------
+            if (!axesParallel)
+            {
+                Debug.Log("skew side side");
+
+                if (TryBuildSideSideSkewSinglePoint_NeverFail(in a, in b, aAxis, bAxis, n, depth, ref cc))
                 {
                     DedupAndCompact(ref cc);
                     cc.globalPenAxis = n;
@@ -189,6 +210,163 @@ namespace Shard.Dev
             cc.globalPenDepth = depth;
             return cc.numContactPoints > 0;
         }
+
+        // Drop-in replacement for your skew side-side builder.
+        // Emits exactly 1 CP on the CORRECT (penetrating) rim.
+        // Assumes SAT already produced nAB (A->B) and satDepth > 0.
+        // Drop-in replacement for your skew side-side builder.
+        // Emits exactly 1 CP ON B'S RIM, but ensures the point is ALSO INSIDE A
+        // by searching the B rim circle at the chosen axial anchor and picking the
+        // deepest (most toward A) point that lies inside A.
+        //
+        // normal = nAB (A->B), depth = satDepth (stable)
+        private static bool TryBuildSideSideSkewSinglePoint_NeverFail(
+    in Cylinder a, in Cylinder b,
+    float3 aAxis, float3 bAxis,
+    float3 nAB, float satDepth,
+    ref CylinderCylinderContactPoints cc)
+        {
+            if (satDepth <= kSlop) return false;
+
+            float3 d = -nAB; // "into A"
+
+            // Closest points between axis segments (gives stable slice)
+            float3 a0 = a.center - aAxis * a.halfHeight;
+            float3 a1 = a.center + aAxis * a.halfHeight;
+            float3 b0 = b.center - bAxis * b.halfHeight;
+            float3 b1 = b.center + bAxis * b.halfHeight;
+            ClosestPoints_SegmentSegment(a0, a1, b0, b1, out _, out float3 pB);
+
+            // Basis for B radial plane
+            BuildStableOrthoBasis(bAxis, out float3 uB, out float3 vB);
+
+            // Deep direction on B rim (projection of d onto B radial plane)
+            float3 r = d - bAxis * math.dot(d, bAxis);
+            float rLenSq = math.lengthsq(r);
+            if (rLenSq < 1e-12f)
+            {
+                // d almost parallel to bAxis -> not a side-side direction; let other manifolds handle
+                return false;
+            }
+            r *= math.rsqrt(rLenSq);
+
+            // Unconstrained deepest rim point on that ring
+            float3 p = pB + r * b.radius;
+
+            // If inside A, we're done
+            if (PointInsideFiniteCylinder(in a, aAxis, p, 1e-5f))
+            {
+                EmitOne(ref cc, p, nAB, satDepth);
+                return true;
+            }
+
+            // Otherwise, we want the deepest point on THIS rim circle that is still inside A.
+            // Approx: clamp to the rim-circle point that lies on the plane dot(x,d)=k,
+            // where k is A's support value in direction d at that slice height.
+            //
+            // We approximate k using A's support point in direction d (closed-form support for finite cylinder).
+            float3 xSupA = SupportFiniteCylinder_NoRot(in a, aAxis, d);
+            float k = math.dot(xSupA, d);
+
+            // We need a point on the B rim circle maximizing dot(p,d) but <= k.
+            // For a circle, dot(p(θ),d) = dot(C,d) + b.radius * dot(rimDir(θ), d_rad)
+            // Max is at r, but if it violates <=k, we slide back along the circle to satisfy equality.
+            float Cdot = math.dot(pB, d);
+            float maxDot = Cdot + b.radius * math.dot(r, d); // since rimDir=r at max
+                                                             // Note dot(r,d) == |proj(d)|, positive
+
+            float target = math.min(maxDot, k);
+
+            // Solve for rimDir on circle such that dot(pB + b.radius*rimDir, d) = target
+            // => dot(rimDir, d) = (target - Cdot)/b.radius
+            float rhs = (target - Cdot) / math.max(b.radius, 1e-20f);
+
+            // Express rimDir = uB*c + vB*s. Then dot(rimDir,d)=c*dot(uB,d)+s*dot(vB,d).
+            float A1 = math.dot(uB, d);
+            float B1 = math.dot(vB, d);
+            float L = math.sqrt(A1 * A1 + B1 * B1);
+            if (L < 1e-12f) return false;
+
+            // Normalize: let A1'=A1/L, B1'=B1/L. Then c*A1'+s*B1' = rhs/L.
+            float rhsN = rhs / L;
+
+            // Clamp: if rhsN < -1 or > 1, no intersection (fallback)
+            rhsN = math.clamp(rhsN, -1f, 1f);
+
+            // Solutions on unit circle:
+            // Choose the solution closest to the unconstrained max direction (which is along (A1,B1))
+            // Param form: [c,s] = rhsN*[A1',B1'] ± sqrt(1-rhsN^2)*[-B1',A1']
+            float A1n = A1 / L;
+            float B1n = B1 / L;
+
+            float t = math.sqrt(math.max(0f, 1f - rhsN * rhsN));
+
+            float2 sol0 = new float2(rhsN * A1n - t * B1n, rhsN * B1n + t * A1n);
+            float2 sol1 = new float2(rhsN * A1n + t * B1n, rhsN * B1n - t * A1n);
+
+            // Unconstrained max in (c,s) space is proportional to (A1,B1) => (A1n,B1n)
+            float dot0 = sol0.x * A1n + sol0.y * B1n;
+            float dot1 = sol1.x * A1n + sol1.y * B1n;
+            float2 bestCS = (dot0 >= dot1) ? sol0 : sol1;
+
+            float3 rimDirBest = uB * bestCS.x + vB * bestCS.y;
+            float3 pClamped = pB + rimDirBest * b.radius;
+
+            // Final sanity: make sure it's inside A; if caps break this approximation, just bail.
+            if (!PointInsideFiniteCylinder(in a, aAxis, pClamped, 1e-5f))
+                return false;
+
+            EmitOne(ref cc, pClamped, nAB, satDepth);
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void EmitOne(ref CylinderCylinderContactPoints cc, float3 p, float3 nAB, float depth)
+        {
+            cc = default;
+            InvalidateAll(ref cc);
+
+            ContactPoint cp;
+            cp.point = p;
+            cp.normal = nAB;
+            cp.depth = depth;
+
+            Write(ref cc, 0, cp);
+            cc.numContactPoints = 1;
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = depth;
+        }
+
+        // Finite cylinder support for direction d (no rotation, axis provided)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 SupportFiniteCylinder_NoRot(in Cylinder c, float3 cAxis, float3 d)
+        {
+            // Choose cap along axis
+            float sd = math.dot(d, cAxis);
+            float h = (sd >= 0f) ? c.halfHeight : -c.halfHeight;
+
+            // Radial part
+            float3 dr = d - cAxis * sd;
+            float lenSq = math.lengthsq(dr);
+            float3 r = (lenSq > 1e-20f) ? (dr * (c.radius * math.rsqrt(lenSq))) : float3.zero;
+
+            return c.center + cAxis * h + r;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool PointInsideFiniteCylinder(in Cylinder c, float3 cAxis, float3 p, float eps)
+        {
+            float3 d = p - c.center;
+
+            float h = math.dot(d, cAxis);
+            if (h > c.halfHeight + eps || h < -c.halfHeight - eps)
+                return false;
+
+            float3 radial = d - cAxis * h;
+            float rr = (c.radius + eps);
+            return math.lengthsq(radial) <= rr * rr;
+        }
+
 
         #region Edge intersects Cap
 
@@ -301,6 +479,153 @@ namespace Shard.Dev
             return EmitEdgeCapContactFromRimPoint(
                 bestP, capCenter, capNormalOut, nAB, satDepth, ref cc);
         }
+
+        #region Side-side non-perpendicular intersection
+        private static bool TryBuildSideSideSkewSinglePoint(
+    in Cylinder a, in Cylinder b,
+    float3 aAxis, float3 bAxis,
+    float3 nAB, float satDepth,
+    ref CylinderCylinderContactPoints cc)
+        {
+            // Find closest points between the two finite axis segments
+            float3 a0 = a.center - aAxis * a.halfHeight;
+            float3 a1 = a.center + aAxis * a.halfHeight;
+
+            float3 b0 = b.center - bAxis * b.halfHeight;
+            float3 b1 = b.center + bAxis * b.halfHeight;
+
+            ClosestPoints_SegmentSegment(a0, a1, b0, b1, out float3 pA, out float3 pB);
+
+            // Build radial dir on A (perp to aAxis)
+            float3 c = pB - pA;
+            float3 rA = c - aAxis * math.dot(c, aAxis);
+            float rALenSq = math.lengthsq(rA);
+            if (rALenSq < 1e-12f)
+                return false;
+
+            rA *= math.rsqrt(rALenSq);
+
+            // Orient rA from A->B
+            if (math.dot(rA, c) < 0f) rA = -rA;
+
+            // Build radial dir on B (perp to bAxis) using opposite connector
+            float3 cB = pA - pB;
+            float3 rB = cB - bAxis * math.dot(cB, bAxis);
+            float rBLenSq = math.lengthsq(rB);
+            if (rBLenSq < 1e-12f)
+            {
+                // Fallback: just use -rA (still stable)
+                rB = -rA;
+            }
+            else
+            {
+                rB *= math.rsqrt(rBLenSq);
+                if (math.dot(rB, cB) < 0f) rB = -rB;
+            }
+
+            // Witness points on side surfaces (“rim”) at the closest axial locations
+            float3 wA = pA + rA * a.radius;
+            float3 wB = pB + rB * b.radius;
+
+            // Compute penetration along solver axis
+            float dep = math.abs(math.dot(wA - wB, nAB));
+            if (dep <= kSlop) dep = satDepth;
+            if (dep <= kSlop) return false;
+
+            // Contact point requested: "at the rim of the deepest part of the overlapping"
+            // Put it on A's rim, but shifted half-way toward the opposing witness for stability.
+            float3 point = 0.5f * (wA + wB);
+
+            cc = default;
+            InvalidateAll(ref cc);
+
+            ContactPoint cp;
+            cp.point = point;
+            cp.normal = nAB;
+            cp.depth = dep;
+
+            Write(ref cc, 0, cp);
+            cc.numContactPoints = 1;
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = math.max(satDepth, dep);
+            return true;
+        }
+
+        // Robust closest points between two segments in 3D
+        // Returns points on each segment (pA on [a0,a1], pB on [b0,b1])
+        private static void ClosestPoints_SegmentSegment(
+            float3 a0, float3 a1,
+            float3 b0, float3 b1,
+            out float3 pA, out float3 pB)
+        {
+            float3 d1 = a1 - a0;
+            float3 d2 = b1 - b0;
+            float3 r = a0 - b0;
+
+            float a = math.dot(d1, d1);
+            float e = math.dot(d2, d2);
+            float f = math.dot(d2, r);
+
+            float s, t;
+
+            if (a <= 1e-20f && e <= 1e-20f)
+            {
+                // Both degenerate
+                s = t = 0f;
+                pA = a0;
+                pB = b0;
+                return;
+            }
+
+            if (a <= 1e-20f)
+            {
+                // A degenerate
+                s = 0f;
+                t = math.clamp(f / math.max(e, 1e-20f), 0f, 1f);
+            }
+            else
+            {
+                float c = math.dot(d1, r);
+
+                if (e <= 1e-20f)
+                {
+                    // B degenerate
+                    t = 0f;
+                    s = math.clamp(-c / math.max(a, 1e-20f), 0f, 1f);
+                }
+                else
+                {
+                    float b = math.dot(d1, d2);
+                    float denom = a * e - b * b;
+
+                    if (denom != 0f)
+                        s = math.clamp((b * f - c * e) / denom, 0f, 1f);
+                    else
+                        s = 0f; // parallel-ish
+
+                    float tNom = b * s + f;
+                    if (tNom < 0f)
+                    {
+                        t = 0f;
+                        s = math.clamp(-c / math.max(a, 1e-20f), 0f, 1f);
+                    }
+                    else if (tNom > e)
+                    {
+                        t = 1f;
+                        s = math.clamp((b - c) / math.max(a, 1e-20f), 0f, 1f);
+                    }
+                    else
+                    {
+                        t = tNom / e;
+                    }
+                }
+            }
+
+            pA = a0 + d1 * s;
+            pB = b0 + d2 * t;
+        }
+
+        #endregion
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool EmitEdgeCapContactFromRimPoint(
