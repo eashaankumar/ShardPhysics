@@ -120,6 +120,7 @@ namespace Shard.Dev
             // ------------------------------------------------------------
             if (!built)
             {
+                Debug.Log("Cap side " + Time.time);
                 built = TryBuildCapSide_FromClosestPoints(in a, in b, aAxis, bAxis, n, depth, ref cc);
             }
 
@@ -166,7 +167,7 @@ namespace Shard.Dev
             cc.globalPenAxis = n;
             cc.globalPenDepth = depth;
 
-            ForcePointsOnCylinderA_AndFixNormals(in a, aAxis, n, ref cc);
+            //ForcePointsOnCylinderA_AndFixNormals(in a, aAxis, n, ref cc);
 
             // optional: small dedup again since projection can collapse points
             DedupAndCompact(ref cc);
@@ -227,109 +228,239 @@ namespace Shard.Dev
             float3 capNormalOut = capAxis * s;
 
             // Now build 2-point edge segment on the SIDE cylinder, clipped to the CAP disk
-            return BuildCapSide_EdgeSegment_TwoPoints(
-                in capCyl, capCenter, capNormalOut,
+            return BuildCapSide_YourSpec(
+                in capCyl, capCenter, capNormalOut, capAxis,
                 in sideCyl, sideAxis,
                 nAB, satDepth,
                 ref cc);
         }
 
-        private static bool BuildCapSide_EdgeSegment_TwoPoints(
-    in Cylinder cap, float3 capCenter, float3 capNormalOut,
-    in Cylinder side, float3 sideAxis,
+        private static bool BuildCapSide_YourSpec(
+    in Cylinder Cc, float3 capCenter, float3 capNormalOut, float3 CcAxis,
+    in Cylinder Ce, float3 CeAxis,
     float3 nAB, float satDepth,
     ref CylinderCylinderContactPoints cc)
         {
-            // Cap plane basis
-            BuildStableOrthoBasis(capNormalOut, out float3 u, out float3 v);
-
-            // True inward direction on SIDE surface: project -capNormalOut into side radial plane
-            float3 inwardDir = -capNormalOut;
-            inwardDir -= sideAxis * math.dot(inwardDir, sideAxis);
-            float lenSq = math.lengthsq(inwardDir);
-            if (lenSq < 1e-12f)
-                return false;
-
-            inwardDir *= math.rsqrt(lenSq);
-
-            // Line on side surface (generatrix):
-            // P(t) = side.center + sideAxis*t + inwardDir*side.radius
-            float3 baseP = side.center + inwardDir * side.radius;
-
-            // Express in cap plane coords: (x(t), y(t)) = (x0,y0) + t*(dx,dy)
-            float3 rel0 = baseP - capCenter;
-            float x0 = math.dot(rel0, u);
-            float y0 = math.dot(rel0, v);
-
-            float dx = math.dot(sideAxis, u);
-            float dy = math.dot(sideAxis, v);
-
-            float R = cap.radius;
-
-            // Quadratic for intersection with disk: (x0+dx*t)^2 + (y0+dy*t)^2 <= R^2
-            float A = dx * dx + dy * dy;
-            float B = 2f * (x0 * dx + y0 * dy);
-            float C = (x0 * x0 + y0 * y0) - R * R;
-
-            float tMinDisk, tMaxDisk;
-
-            if (A < 1e-12f)
+            // ------------------------------------------------------------
+            // 0) Build Ce edge line (infinite): O + CeAxis * t
+            // Choose rDir on Ce that points toward the cap region.
+            // ------------------------------------------------------------
+            float3 rDir = capCenter - Ce.center;
+            rDir -= CeAxis * math.dot(rDir, CeAxis);
+            float rLenSq = math.lengthsq(rDir);
+            if (rLenSq < 1e-12f)
             {
-                if (C > 1e-6f) return false; // outside disk
-                tMinDisk = -side.halfHeight;
-                tMaxDisk = +side.halfHeight;
+                // fallback: use -capNormal projected into Ce radial plane
+                rDir = -capNormalOut;
+                rDir -= CeAxis * math.dot(rDir, CeAxis);
+                rLenSq = math.lengthsq(rDir);
+                if (rLenSq < 1e-12f) return false;
+            }
+            rDir *= math.rsqrt(rLenSq);
+
+            float3 O = Ce.center + rDir * Ce.radius; // a point on Ce edge line
+            float3 D = CeAxis;                      // line dir (unit)
+
+            // ------------------------------------------------------------
+            // 1) capEdgeP = intersection of Ce edge line with Cc cap plane,
+            // then clamp to Cc disk (since you want it "on Cc cap plane").
+            // ------------------------------------------------------------
+            float denom = math.dot(D, capNormalOut);
+            float tCap;
+            if (math.abs(denom) < 1e-10f)
+                tCap = math.dot(capCenter - O, D);              // closest slice
+            else
+                tCap = math.dot(capCenter - O, capNormalOut) / denom;
+
+            float3 capEdgeP = O + D * tCap;
+            capEdgeP = ProjectToPlane(capEdgeP, capCenter, capNormalOut);
+
+            // clamp to Cc disk
+            {
+                float3 d = capEdgeP - capCenter;
+                d -= capNormalOut * math.dot(d, capNormalOut);
+                float dsq = math.lengthsq(d);
+                float R = Cc.radius;
+                if (dsq > R * R && dsq > 1e-20f)
+                    capEdgeP = capCenter + d * (R * math.rsqrt(dsq));
+            }
+
+            // ------------------------------------------------------------
+            // 2) edgeEdgeClampP = intersection of Ce edge line with infinite
+            // Cc SIDE surface, then clamp t to Ce extents.
+            // If no real intersection, clamp to whichever endpoint is closest.
+            // ------------------------------------------------------------
+            float t0, t1;
+            bool hit = LineVsInfiniteCylinderSide(O, D, Cc.center, CcAxis, Cc.radius, out t0, out t1);
+
+            float tEdge;
+
+            if (hit)
+            {
+                // choose the root whose clamped version is closer to the true root
+                float t0c = math.clamp(t0, -Ce.halfHeight, +Ce.halfHeight);
+                float t1c = math.clamp(t1, -Ce.halfHeight, +Ce.halfHeight);
+
+                // prefer the one less disturbed by clamp
+                float err0 = math.abs(t0c - t0);
+                float err1 = math.abs(t1c - t1);
+                tEdge = (err0 <= err1) ? t0c : t1c;
             }
             else
             {
-                float disc = B * B - 4f * A * C;
-                if (disc < 0f) return false;
+                // no intersection: clamp to ends (your “clamp if never exists”)
+                float tA = -Ce.halfHeight;
+                float tB = +Ce.halfHeight;
 
-                float sqrtDisc = math.sqrt(math.max(0f, disc));
-                float inv2A = 0.5f / A;
+                // pick endpoint that is *closest* to Cc side surface
+                float3 pA = O + D * tA;
+                float3 pB = O + D * tB;
 
-                float r0 = (-B - sqrtDisc) * inv2A;
-                float r1 = (-B + sqrtDisc) * inv2A;
-                if (r1 < r0) { float tmp = r0; r0 = r1; r1 = tmp; }
+                float da = math.sqrt(DistSqPointToAxis(pA, Cc.center, CcAxis));
+                float db = math.sqrt(DistSqPointToAxis(pB, Cc.center, CcAxis));
 
-                tMinDisk = r0;
-                tMaxDisk = r1;
+                float ea = math.abs(da - Cc.radius);
+                float eb = math.abs(db - Cc.radius);
+
+                tEdge = (ea <= eb) ? tA : tB;
             }
 
-            // Clip to finite cylinder height
-            float t0 = math.max(tMinDisk, -side.halfHeight);
-            float t1 = math.min(tMaxDisk, +side.halfHeight);
-            if (t1 < t0) return false;
+            float3 edgeEdgeClampP = O + D * tEdge;
 
-            float3 p0 = baseP + sideAxis * t0;
-            float3 p1 = baseP + sideAxis * t1;
+            // ------------------------------------------------------------
+            // 3) edgeMidP
+            // ------------------------------------------------------------
+            float3 edgeMidP = 0.5f * (capEdgeP + edgeEdgeClampP);
+
+            // ------------------------------------------------------------
+            // 4) deepestRimP (YOUR WAY):
+            // intersect infinite Ce edge with infinite Cc side -> take that intersection point,
+            // project up to Cc cap plane, then push to rim.
+            // ------------------------------------------------------------
+            float tInf;
+            if (hit)
+            {
+                // choose the intersection closer to the cap plane (more “vertically below the rim”)
+                float3 pI0 = O + D * t0;
+                float3 pI1 = O + D * t1;
+                float a0 = math.abs(math.dot(pI0 - capCenter, capNormalOut));
+                float a1 = math.abs(math.dot(pI1 - capCenter, capNormalOut));
+                tInf = (a0 <= a1) ? t0 : t1;
+            }
+            else
+            {
+                // if no analytic intersection, use unclamped tCap slice as a proxy “below rim”
+                tInf = tCap;
+            }
+
+            float3 pInt = O + D * tInf;                                 // “below rim” on infinite geometry
+            float3 pOnCapPlane = ProjectToPlane(pInt, capCenter, capNormalOut);
+
+            float3 rimDir = SafeNormalizeInPlane(pOnCapPlane - capCenter, capNormalOut);
+            float3 deepestRimP = capCenter + rimDir * Cc.radius;
+
+            // ------------------------------------------------------------
+            // 5) Final CP per your spec
+            // normal = direction(deepestRimP, edgeMidP)
+            // depth = dist(deepestRimP, edgeMidP)
+            // ------------------------------------------------------------
+            float3 sep = edgeMidP - deepestRimP; // direction(deepestRimP -> edgeMidP)
+            float dist = math.length(sep);
+            if (dist <= 1e-8f) return false;
+
+            float3 n = sep / dist;
+
+            // maintain solver convention (A->B) using SAT axis as reference
+            if (math.dot(n, nAB) < 0f) n = -n;
+
+            float depth = dist;
+            depth = math.min(depth, satDepth + 1e-3f); // optional sanity clamp
 
             cc = default;
             InvalidateAll(ref cc);
 
-            // Emit 2 points if segment; 1 if tangent
-            if ((t1 - t0) < 1e-6f)
-            {
-                ContactPoint cp;
-                cp.point = p0;
-                cp.normal = nAB;
-                cp.depth = satDepth;
+            ContactPoint cp;
+            cp.point = 0.5f * (deepestRimP + edgeMidP);
+            cp.normal = n;
+            cp.depth = depth;
 
-                Write(ref cc, 0, cp);
-                cc.numContactPoints = 1;
-            }
-            else
-            {
-                ContactPoint cp0; cp0.point = p0; cp0.normal = nAB; cp0.depth = satDepth;
-                ContactPoint cp1; cp1.point = p1; cp1.normal = nAB; cp1.depth = satDepth;
-
-                Write(ref cc, 0, cp0);
-                Write(ref cc, 1, cp1);
-                cc.numContactPoints = 2;
-            }
-
+            Write(ref cc, 0, cp);
+            cc.numContactPoints = 1;
             cc.globalPenAxis = nAB;
             cc.globalPenDepth = satDepth;
             return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float DistSqPointToAxis(float3 p, float3 axisPoint, float3 axisUnit)
+        {
+            // axisUnit MUST be normalized
+            float3 d = p - axisPoint;
+
+            float proj = math.dot(d, axisUnit);     // axial component
+            float3 radial = d - axisUnit * proj;    // perpendicular component
+
+            return math.dot(radial, radial);        // squared distance
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 ProjectToPlane(float3 p, float3 planePoint, float3 planeN)
+        {
+            float sd = math.dot(p - planePoint, planeN);
+            return p - planeN * sd;
+        }
+
+        // Solve intersection of line L(t)=O+D*t with infinite cylinder side surface:
+        // distance from L(t) to axis line (Cc.center + CcAxis*s) equals radius.
+        private static bool LineVsInfiniteCylinderSide(
+            float3 O, float3 D,                 // line origin, dir (need not be perp)
+            float3 C, float3 A, float R,         // cylinder center, unit axis, radius
+            out float t0, out float t1)
+        {
+            // Decompose into components perpendicular to axis
+            float dA = math.dot(D, A);
+            float3 Dp = D - A * dA;
+
+            float3 w0 = O - C;
+            float wA = math.dot(w0, A);
+            float3 w0p = w0 - A * wA;
+
+            float a = math.dot(Dp, Dp);
+            float b = 2f * math.dot(w0p, Dp);
+            float c = math.dot(w0p, w0p) - R * R;
+
+            if (a < 1e-12f)
+            {
+                t0 = t1 = 0f;
+                return false;
+            }
+
+            float disc = b * b - 4f * a * c;
+            if (disc < 0f)
+            {
+                t0 = t1 = 0f;
+                return false;
+            }
+
+            float sDisc = math.sqrt(disc);
+            float inv2a = 0.5f / a;
+            t0 = (-b - sDisc) * inv2a;
+            t1 = (-b + sDisc) * inv2a;
+            if (t1 < t0) { float tmp = t0; t0 = t1; t1 = tmp; }
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 SafeNormalizeInPlane(float3 v, float3 planeN)
+        {
+            v -= planeN * math.dot(v, planeN);
+            float lsq = math.lengthsq(v);
+            if (lsq < 1e-20f)
+            {
+                BuildStableOrthoBasis(planeN, out float3 u, out _);
+                return u;
+            }
+            return v * math.rsqrt(lsq);
         }
 
 
