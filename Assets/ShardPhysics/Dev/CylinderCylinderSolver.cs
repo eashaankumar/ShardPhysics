@@ -129,8 +129,6 @@ namespace Shard.Dev
             // 3) CAP–SIDE EDGE @ ~90° (THIS MUST RUN BEFORE CONVEX FALLBACK)
             // Emits EXACTLY 2 points (min/max bounds of intersecting edge)
             // ---------------------------
-
-
             // We want a forgiving "near 90°" test. (Adjust window if needed.)
             bool axesPerp = axesDot < 0.05f;
 
@@ -156,6 +154,31 @@ namespace Shard.Dev
             }
 
             // ---------------------------
+            // 3.5) EDGE-RIM vs CAP (circular rim intersects other cap disk)
+            // Emits 1 or 2 points (circle-plane line intersection, clipped to disk)
+            // Must run before convex fallback.
+            // ---------------------------
+            {
+                // A rim vs B cap
+                if (TryBuildEdgeCapRim(in a, in b, aAxis, bAxis, n, depth, ref cc))
+                {
+                    DedupAndCompact(ref cc);
+                    cc.globalPenAxis = n;
+                    cc.globalPenDepth = depth;
+                    return cc.numContactPoints > 0;
+                }
+
+                // B rim vs A cap
+                if (TryBuildEdgeCapRim(in b, in a, bAxis, aAxis, n, depth, ref cc))
+                {
+                    DedupAndCompact(ref cc);
+                    cc.globalPenAxis = n;
+                    cc.globalPenDepth = depth;
+                    return cc.numContactPoints > 0;
+                }
+            }
+
+            // ---------------------------
             // 4) FALLBACK: generic convex-style reduction
             // (This can emit up to 4 — by design.)
             // ---------------------------
@@ -166,6 +189,164 @@ namespace Shard.Dev
             cc.globalPenDepth = depth;
             return cc.numContactPoints > 0;
         }
+
+        #region Edge intersects Cap
+
+        private static bool TryBuildEdgeCapRim(
+            in Cylinder edgeCyl, in Cylinder capCyl,
+            float3 edgeAxis, float3 capAxis,
+            float3 nAB, float satDepth,
+            ref CylinderCylinderContactPoints cc)
+        {
+            // We want nEdge pointing EDGE -> CAP to choose the facing rim.
+            float3 nEdge = nAB;
+            float3 edgeToCap = capCyl.center - edgeCyl.center;
+            if (math.dot(nEdge, edgeToCap) < 0f)
+                nEdge = -nEdge;
+
+            // Choose which rim of edgeCyl faces capCyl
+            float sEdge = (math.dot(edgeAxis, nEdge) >= 0f) ? +1f : -1f;
+            float3 edgeRimCenter = edgeCyl.center + edgeAxis * (sEdge * edgeCyl.halfHeight);
+            float3 edgeRimNormal = edgeAxis;
+
+            // Choose which cap of capCyl faces edgeCyl (outward normal toward edge)
+            float3 capToEdge = edgeCyl.center - capCyl.center;
+            float sCap = (math.dot(capAxis, capToEdge) >= 0f) ? +1f : -1f;
+            float3 capCenter = capCyl.center + capAxis * (sCap * capCyl.halfHeight);
+            float3 capNormalOut = capAxis * sCap;
+
+            // ------------------------------------------------------------
+            // 1) Deepest rim point relative to the cap plane
+            // ------------------------------------------------------------
+            // Project cap normal into rim plane to get "in-plane" direction.
+            float3 q = capNormalOut - edgeRimNormal * math.dot(capNormalOut, edgeRimNormal);
+            float qLenSq = math.lengthsq(q);
+
+            if (qLenSq > 1e-12f)
+            {
+                q *= math.rsqrt(qLenSq);
+
+                // Deepest rim point is opposite q (most negative plane distance)
+                float3 pDeep = edgeRimCenter - q * edgeCyl.radius;
+
+                // Test by projection into cap disk (NOT "must be on plane")
+                if (ProjectsInsideCapDisk(pDeep, capCenter, capNormalOut, capCyl.radius))
+                {
+                    return EmitEdgeCapContactFromRimPoint(
+                        pDeep, capCenter, capNormalOut, nAB, satDepth, ref cc);
+                }
+            }
+
+            // ------------------------------------------------------------
+            // 2) Otherwise: rim circle intersects cap plane -> 0/1/2 points.
+            // Pick a valid endpoint whose projection lies in the disk.
+            // ------------------------------------------------------------
+            float3 lineDir = math.cross(edgeRimNormal, capNormalOut);
+            float lineDirLenSq = math.lengthsq(lineDir);
+            if (lineDirLenSq < 1e-12f)
+                return false;
+
+            float3 l = math.cross(edgeRimNormal, capNormalOut);
+            float lLenSq = math.lengthsq(l);
+            if (lLenSq < 1e-12f)
+                return false;
+
+            float d0 = math.dot(edgeRimNormal, edgeRimCenter);
+            float d1 = math.dot(capNormalOut, capCenter);
+
+            float3 x0 =
+                (d0 * math.cross(capNormalOut, l) +
+                 d1 * math.cross(l, edgeRimNormal)) / lLenSq;
+
+            lineDir *= math.rsqrt(lineDirLenSq);
+
+            // Intersect line with rim circle
+            float3 m = x0 - edgeRimCenter;
+            float B = 2f * math.dot(lineDir, m);
+            float C = math.dot(m, m) - edgeCyl.radius * edgeCyl.radius;
+            float disc = B * B - 4f * C; // A=1 (lineDir normalized)
+
+            if (disc < 0f)
+                return false;
+
+            float sqrtDisc = math.sqrt(math.max(0f, disc));
+            float tA = (-B - sqrtDisc) * 0.5f;
+            float tB = (-B + sqrtDisc) * 0.5f;
+
+            float3 pA = x0 + lineDir * tA;
+            float3 pB = x0 + lineDir * tB;
+
+            bool okA = ProjectsInsideCapDisk(pA, capCenter, capNormalOut, capCyl.radius);
+            bool okB = ProjectsInsideCapDisk(pB, capCenter, capNormalOut, capCyl.radius);
+
+            if (!okA && !okB)
+                return false;
+
+            // Prefer the endpoint with smallest signed distance (most "behind"),
+            // but DO NOT require it to be negative (these are often ~0).
+            float bestSd = float.PositiveInfinity;
+            float3 bestP = default;
+
+            if (okA)
+            {
+                float sd = math.dot(pA - capCenter, capNormalOut);
+                if (sd < bestSd) { bestSd = sd; bestP = pA; }
+            }
+            if (okB)
+            {
+                float sd = math.dot(pB - capCenter, capNormalOut);
+                if (sd < bestSd) { bestSd = sd; bestP = pB; }
+            }
+
+            return EmitEdgeCapContactFromRimPoint(
+                bestP, capCenter, capNormalOut, nAB, satDepth, ref cc);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool EmitEdgeCapContactFromRimPoint(
+            float3 pRim,
+            float3 capCenter,
+            float3 capNormalOut,
+            float3 nAB,
+            float satDepth,
+            ref CylinderCylinderContactPoints cc)
+        {
+            // Cap witness = projection of rim point onto cap plane along cap normal
+            float sd = math.dot(pRim - capCenter, capNormalOut);
+            float3 pCap = pRim - capNormalOut * sd;
+
+            // Stable shared point (matches your ContactPoint comment)
+            float3 shared = 0.5f * (pRim + pCap);
+
+            // Depth from witness separation along solver axis (fallback to SAT depth if tiny)
+            float dep = math.abs(math.dot(pCap - pRim, nAB));
+            if (dep <= kSlop) dep = satDepth;
+
+            cc = default;
+            InvalidateAll(ref cc);
+
+            ContactPoint cp;
+            cp.point = shared;
+            cp.normal = nAB;
+            cp.depth = dep;
+
+            Write(ref cc, 0, cp);
+            cc.numContactPoints = 1;
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = math.max(satDepth, dep);
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool ProjectsInsideCapDisk(float3 p, float3 capCenter, float3 capNormal, float capRadius)
+        {
+            // Project p onto cap plane and test radius in-plane
+            float sd = math.dot(p - capCenter, capNormal);
+            float3 inPlane = (p - capCenter) - capNormal * sd;
+            return math.lengthsq(inPlane) <= capRadius * capRadius + 1e-6f;
+        }
+
+        #endregion
 
 
         private static bool TryBuildCapSideEdge(
