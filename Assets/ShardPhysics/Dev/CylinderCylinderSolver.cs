@@ -684,8 +684,8 @@ namespace Shard.Dev
 
             float3 intoCap = -capNormalOut;
 
-            // Rim plane basis
-            BuildStableOrthoBasis(edgeAxis, out float3 uE, out float3 vE);
+            // Rim plane basis (used for stable fallbacks)
+            BuildStableOrthoBasis(edgeAxis, out float3 uE, out _);
 
             // ------------------------------------------------------------
             // 1) Unconstrained deepest rim point (maximize dot(p, intoCap))
@@ -694,65 +694,74 @@ namespace Shard.Dev
             float dirLenSq = math.lengthsq(dir);
             if (dirLenSq < 1e-20f)
             {
-                // intoCap parallel to rim normal -> pick stable in-plane axis
                 dir = uE;
                 dirLenSq = 1f;
             }
             dir *= math.rsqrt(dirLenSq);
 
-            float3 p0 = edgeRimCenter + dir * edgeCyl.radius;
+            float3 pRim = edgeRimCenter + dir * edgeCyl.radius;
 
-            // If already valid, emit it
-            if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, p0))
+            // If not valid, do the one-shot correction: clamp to CAP volume then re-project to rim
+            if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pRim))
             {
-                cc = default;
-                InvalidateAll(ref cc);
+                float3 q = ClampPointToFiniteCylinderVolume(in capCyl, capAxis, pRim);
 
-                ContactPoint cp;
-                cp.point = p0;
-                cp.normal = nAB;
-                cp.depth = satDepth;
+                // project q onto rim plane, then clamp to rim circle
+                float3 qProj = q - edgeAxis * math.dot(q - edgeRimCenter, edgeAxis);
+                float3 d = qProj - edgeRimCenter;
+                float dsq = math.lengthsq(d);
+                if (dsq < 1e-20f) return false;
 
-                Write(ref cc, 0, cp);
-                cc.numContactPoints = 1;
-                cc.globalPenAxis = nAB;
-                cc.globalPenDepth = satDepth;
-                return true;
+                d *= math.rsqrt(dsq);
+                pRim = edgeRimCenter + d * edgeCyl.radius;
+
+                if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pRim))
+                    return false;
             }
 
             // ------------------------------------------------------------
-            // 2) One-shot correction (NO ITERATION):
-            // Clamp p0 into CAP volume, then re-project to the RIM circle.
+            // 2) Project that deepest rim point onto the OTHER'S CAP (disk)
             // ------------------------------------------------------------
-            float3 q = ClampPointToFiniteCylinderVolume(in capCyl, capAxis, p0);
+            // Project to cap plane
+            float sd = math.dot(pRim - capCenter, capNormalOut);
+            float3 pCap = pRim - capNormalOut * sd;
 
-            // project q onto rim plane, then clamp to rim circle
-            float3 qProj = q - edgeAxis * math.dot(q - edgeRimCenter, edgeAxis);
-            float3 d = qProj - edgeRimCenter;
-            float dsq = math.lengthsq(d);
-            if (dsq < 1e-20f)
-                return false; // can't form direction in rim plane
+            // Clamp to cap disk radius
+            {
+                float3 inPlane = pCap - capCenter;
+                inPlane -= capNormalOut * math.dot(inPlane, capNormalOut); // should be ~0 already
+                float dsq = math.lengthsq(inPlane);
+                float R = capCyl.radius;
 
-            d *= math.rsqrt(dsq);
-            float3 p1 = edgeRimCenter + d * edgeCyl.radius;
+                if (dsq > R * R && dsq > 1e-20f)
+                    pCap = capCenter + inPlane * (R * math.rsqrt(dsq));
+            }
 
-            if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, p1))
-                return false;
+            // (Optional but recommended) ensure the cap point really lies inside the CAP cylinder.
+            // It should, because it's on the chosen cap plane and clamped to disk.
+            // If you want to be strict, you can uncomment:
+            // if (!PointInsideFiniteCylinder(in capCyl, capAxis, pCap, 1e-5f)) return false;
+
+            // ------------------------------------------------------------
+            // 3) Midpoint between rim point and its cap projection
+            // ------------------------------------------------------------
+            float3 mid = 0.5f * (pRim + pCap);
 
             cc = default;
             InvalidateAll(ref cc);
 
-            ContactPoint cp1;
-            cp1.point = p1;
-            cp1.normal = nAB;
-            cp1.depth = satDepth;
+            ContactPoint cp;
+            cp.point = mid;
+            cp.normal = nAB;
+            cp.depth = satDepth;
 
-            Write(ref cc, 0, cp1);
+            Write(ref cc, 0, cp);
             cc.numContactPoints = 1;
             cc.globalPenAxis = nAB;
             cc.globalPenDepth = satDepth;
             return true;
         }
+
 
 
         #endregion
