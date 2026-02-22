@@ -162,7 +162,7 @@ namespace Shard.Dev
 
             // Keep SAT axis/depth stable, but fix points so they are inside BOTH volumes.
             DedupAndCompact(ref cc);
-            RepairAndFilterManifold(in a, in b, aAxis, bAxis, ref cc);
+            //RepairAndFilterManifold(in a, in b, aAxis, bAxis, ref cc);
 
             cc.globalPenAxis = n;
             cc.globalPenDepth = depth;
@@ -170,7 +170,7 @@ namespace Shard.Dev
             //ForcePointsOnCylinderA_AndFixNormals(in a, aAxis, n, ref cc);
 
             // optional: small dedup again since projection can collapse points
-            DedupAndCompact(ref cc);
+            //DedupAndCompact(ref cc);
 
             return cc.numContactPoints > 0;
         }
@@ -228,54 +228,62 @@ namespace Shard.Dev
             float3 capNormalOut = capAxis * s;
 
             // Now build 2-point edge segment on the SIDE cylinder, clipped to the CAP disk
-            return BuildCapSide_YourSpec(
+            return BuildCapSide_Regen_OnePoint(
                 in capCyl, capCenter, capNormalOut, capAxis,
                 in sideCyl, sideAxis,
                 nAB, satDepth,
                 ref cc);
         }
 
-        private static bool BuildCapSide_YourSpec(
-    in Cylinder Cc, float3 capCenter, float3 capNormalOut, float3 CcAxis,
-    in Cylinder Ce, float3 CeAxis,
-    float3 nAB, float satDepth,
-    ref CylinderCylinderContactPoints cc)
+        // === REGENERATED CAP–SIDE MANIFOLD (ONE POINT) ===
+        // Cc = cap cylinder being penetrated
+        // Ce = edge cylinder doing the penetrating
+        private static bool BuildCapSide_Regen_OnePoint(
+            in Cylinder Cc, float3 capCenter, float3 capNormalOut, float3 CcAxis,
+            in Cylinder Ce, float3 CeAxis,
+            float3 nAB, float satDepth,
+            ref CylinderCylinderContactPoints cc)
         {
             // ------------------------------------------------------------
-            // 0) Build Ce edge line (infinite): O + CeAxis * t
-            // Choose rDir on Ce that points toward the cap region.
+            // 0) Choose Ce edge line (generatrix) that penetrates the cap
             // ------------------------------------------------------------
-            float3 rDir = capCenter - Ce.center;
-            rDir -= CeAxis * math.dot(rDir, CeAxis);
+            float3 intoCap = -capNormalOut; // points into Cc
+
+            float3 rDir = intoCap - CeAxis * math.dot(intoCap, CeAxis);
             float rLenSq = math.lengthsq(rDir);
+
             if (rLenSq < 1e-12f)
             {
-                // fallback: use -capNormal projected into Ce radial plane
-                rDir = -capNormalOut;
+                // fallback: capCenter direction
+                rDir = (capCenter - Ce.center);
                 rDir -= CeAxis * math.dot(rDir, CeAxis);
                 rLenSq = math.lengthsq(rDir);
                 if (rLenSq < 1e-12f) return false;
             }
+
             rDir *= math.rsqrt(rLenSq);
 
-            float3 O = Ce.center + rDir * Ce.radius; // a point on Ce edge line
-            float3 D = CeAxis;                      // line dir (unit)
+            float3 O = Ce.center + rDir * Ce.radius; // point on Ce edge line
+            float3 D = CeAxis;                      // line direction (unit)
 
             // ------------------------------------------------------------
-            // 1) capEdgeP = intersection of Ce edge line with Cc cap plane,
-            // then clamp to Cc disk (since you want it "on Cc cap plane").
+            // 1) capEdgeP: (Ce edge line) ∩ (Cc cap plane), then project + clamp to Cc disk
             // ------------------------------------------------------------
-            float denom = math.dot(D, capNormalOut);
-            float tCap;
-            if (math.abs(denom) < 1e-10f)
-                tCap = math.dot(capCenter - O, D);              // closest slice
+            float denomPlane = math.dot(D, capNormalOut);
+            float tCapLine;
+
+            if (math.abs(denomPlane) < 1e-10f)
+                tCapLine = math.dot(capCenter - O, D); // closest slice
             else
-                tCap = math.dot(capCenter - O, capNormalOut) / denom;
+                tCapLine = math.dot(capCenter - O, capNormalOut) / denomPlane;
 
-            float3 capEdgeP = O + D * tCap;
-            capEdgeP = ProjectToPlane(capEdgeP, capCenter, capNormalOut);
+            // Clamp anchor to Ce segment so root-selection remains stable in near-parallel cases
+            tCapLine = math.clamp(tCapLine, -Ce.halfHeight, +Ce.halfHeight);
 
-            // clamp to Cc disk
+            float3 pLineAtCap = O + D * tCapLine; // ON THE LINE
+            float3 capEdgeP = ProjectToPlane(pLineAtCap, capCenter, capNormalOut);
+
+            // Clamp to Cc disk
             {
                 float3 d = capEdgeP - capCenter;
                 d -= capNormalOut * math.dot(d, capNormalOut);
@@ -286,92 +294,105 @@ namespace Shard.Dev
             }
 
             // ------------------------------------------------------------
-            // 2) edgeEdgeClampP = intersection of Ce edge line with infinite
-            // Cc SIDE surface, then clamp t to Ce extents.
-            // If no real intersection, clamp to whichever endpoint is closest.
+            // 2) Intersect Ce edge line with infinite Cc SIDE surface -> (t0,t1)
             // ------------------------------------------------------------
             float t0, t1;
             bool hit = LineVsInfiniteCylinderSide(O, D, Cc.center, CcAxis, Cc.radius, out t0, out t1);
+            if (!hit) return false;
 
-            float tEdge;
+            // Choose the infinite root "near the cap witness" (stable branch)
+            float dt0 = math.abs(t0 - tCapLine);
+            float dt1 = math.abs(t1 - tCapLine);
+            float tChosenInf = (dt0 <= dt1) ? t0 : t1;
 
-            if (hit)
+            // ------------------------------------------------------------
+            // 3) edgeEdgeClampP with YOUR RULE:
+            // If clamp case, pick the clamped endpoint that is inside BOTH cylinders.
+            // Otherwise, use the actual intersection (already correct).
+            // ------------------------------------------------------------
+            float tMin = -Ce.halfHeight;
+            float tMax = +Ce.halfHeight;
+
+            float3 edgeEdgeClampP;
+
+            if (tChosenInf >= tMin && tChosenInf <= tMax)
             {
-                // choose the root whose clamped version is closer to the true root
-                float t0c = math.clamp(t0, -Ce.halfHeight, +Ce.halfHeight);
-                float t1c = math.clamp(t1, -Ce.halfHeight, +Ce.halfHeight);
-
-                // prefer the one less disturbed by clamp
-                float err0 = math.abs(t0c - t0);
-                float err1 = math.abs(t1c - t1);
-                tEdge = (err0 <= err1) ? t0c : t1c;
+                // Not a clamp case: use actual intersection on the finite edge segment.
+                edgeEdgeClampP = O + D * tChosenInf;
             }
             else
             {
-                // no intersection: clamp to ends (your “clamp if never exists”)
-                float tA = -Ce.halfHeight;
-                float tB = +Ce.halfHeight;
+                // Clamp case: choose endpoint inside BOTH
+                float3 pMin = O + D * tMin;
+                float3 pMax = O + D * tMax;
 
-                // pick endpoint that is *closest* to Cc side surface
-                float3 pA = O + D * tA;
-                float3 pB = O + D * tB;
+                bool okMin = InsideBoth(in Cc, CcAxis, in Ce, CeAxis, pMin);
+                bool okMax = InsideBoth(in Cc, CcAxis, in Ce, CeAxis, pMax);
 
-                float da = math.sqrt(DistSqPointToAxis(pA, Cc.center, CcAxis));
-                float db = math.sqrt(DistSqPointToAxis(pB, Cc.center, CcAxis));
-
-                float ea = math.abs(da - Cc.radius);
-                float eb = math.abs(db - Cc.radius);
-
-                tEdge = (ea <= eb) ? tA : tB;
+                if (okMin && !okMax)
+                {
+                    edgeEdgeClampP = pMin;
+                }
+                else if (okMax && !okMin)
+                {
+                    edgeEdgeClampP = pMax;
+                }
+                else if (okMin && okMax)
+                {
+                    // both valid: pick closer to the cap witness along the EDGE PARAM
+                    // (this keeps the segment glued to the cap-side patch)
+                    float dMin = math.abs(tCapLine - tMin);
+                    float dMax = math.abs(tCapLine - tMax);
+                    edgeEdgeClampP = (dMin <= dMax) ? pMin : pMax;
+                }
+                else
+                {
+                    // neither endpoint is inside both -> no valid clamp solution
+                    return false;
+                }
             }
 
-            float3 edgeEdgeClampP = O + D * tEdge;
-
             // ------------------------------------------------------------
-            // 3) edgeMidP
+            // 4) edgeMidP
             // ------------------------------------------------------------
             float3 edgeMidP = 0.5f * (capEdgeP + edgeEdgeClampP);
 
             // ------------------------------------------------------------
-            // 4) deepestRimP (YOUR WAY):
-            // intersect infinite Ce edge with infinite Cc side -> take that intersection point,
-            // project up to Cc cap plane, then push to rim.
+            // 5) deepestRimP (YOUR WAY):
+            // pick intersection root deepest along intoCap, lift to cap plane, push to rim
             // ------------------------------------------------------------
-            float tInf;
-            if (hit)
-            {
-                // choose the intersection closer to the cap plane (more “vertically below the rim”)
-                float3 pI0 = O + D * t0;
-                float3 pI1 = O + D * t1;
-                float a0 = math.abs(math.dot(pI0 - capCenter, capNormalOut));
-                float a1 = math.abs(math.dot(pI1 - capCenter, capNormalOut));
-                tInf = (a0 <= a1) ? t0 : t1;
-            }
-            else
-            {
-                // if no analytic intersection, use unclamped tCap slice as a proxy “below rim”
-                tInf = tCap;
-            }
+            float3 pI0 = O + D * t0;
+            float3 pI1 = O + D * t1;
 
-            float3 pInt = O + D * tInf;                                 // “below rim” on infinite geometry
+            float s0 = math.dot(pI0, intoCap);
+            float s1 = math.dot(pI1, intoCap);
+
+            float3 pInt = (s0 >= s1) ? pI0 : pI1;
+
             float3 pOnCapPlane = ProjectToPlane(pInt, capCenter, capNormalOut);
 
-            float3 rimDir = SafeNormalizeInPlane(pOnCapPlane - capCenter, capNormalOut);
+            float3 rimDir = pOnCapPlane - capCenter;
+            rimDir -= capNormalOut * math.dot(rimDir, capNormalOut);
+            float rimLenSq = math.lengthsq(rimDir);
+            if (rimLenSq < 1e-20f) return false;
+
+            rimDir *= math.rsqrt(rimLenSq);
+
             float3 deepestRimP = capCenter + rimDir * Cc.radius;
 
+            // You require this
+            if (!PointInsideFiniteCylinder(in Ce, CeAxis, deepestRimP, 1e-5f))
+                return false;
+
             // ------------------------------------------------------------
-            // 5) Final CP per your spec
-            // normal = direction(deepestRimP, edgeMidP)
-            // depth = dist(deepestRimP, edgeMidP)
+            // 6) Final CP per your spec
             // ------------------------------------------------------------
-            float3 sep = edgeMidP - deepestRimP; // direction(deepestRimP -> edgeMidP)
+            float3 sep = edgeMidP - deepestRimP; // deepestRimP -> edgeMidP
             float dist = math.length(sep);
             if (dist <= 1e-8f) return false;
 
             float3 n = sep / dist;
-
-            // maintain solver convention (A->B) using SAT axis as reference
-            if (math.dot(n, nAB) < 0f) n = -n;
+            if (math.dot(n, nAB) < 0f) n = -n; // keep convention consistent
 
             float depth = dist;
             depth = math.min(depth, satDepth + 1e-3f); // optional sanity clamp
@@ -390,6 +411,7 @@ namespace Shard.Dev
             cc.globalPenDepth = satDepth;
             return true;
         }
+
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float DistSqPointToAxis(float3 p, float3 axisPoint, float3 axisUnit)
