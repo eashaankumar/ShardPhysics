@@ -73,14 +73,13 @@ namespace Shard.Dev
             float3 aAxis = GetAxis(in a);
             float3 bAxis = GetAxis(in b);
 
-            // SAT overlap + MTV
             if (!SAT_CylinderCylinder(in a, in b, aAxis, bAxis, out float3 n, out float depth))
                 return false;
 
             if (depth <= kSlop)
                 return false;
 
-            // Orient MTV A->B (must be done BEFORE any classification/manifold)
+            // Orient MTV A->B
             float3 cTo = b.center - a.center;
             if (math.dot(n, cTo) < 0f) n = -n;
 
@@ -98,118 +97,254 @@ namespace Shard.Dev
                 math.abs(math.dot(n, aAxis)) > 0.9f &&
                 math.abs(math.dot(n, bAxis)) > 0.9f;
 
-            // ---------------------------
-            // 1) PARALLEL CAP–CAP (keep your existing behavior)
-            // ---------------------------
-            if (axesParallel && capNormal)
+            bool built = false;
+
+            // ------------------------------------------------------------
+            // 1) PARALLEL CAP–CAP
+            // ------------------------------------------------------------
+            if (!built && axesParallel && capNormal)
             {
-                Debug.Log("Cap cap");
-                if (BuildCapCapParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc))
-                {
-                    DedupAndCompact(ref cc);
-                    cc.globalPenAxis = n;
-                    cc.globalPenDepth = depth;
-                    return cc.numContactPoints > 0;
-                }
+                built = BuildCapCapParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc);
             }
 
-            // ---------------------------
-            // 2) PARALLEL SIDE–SIDE (keep your existing behavior)
-            // ---------------------------
-            if (axesParallel && sideNormal)
+            // ------------------------------------------------------------
+            // 2) PARALLEL SIDE–SIDE
+            // ------------------------------------------------------------
+            if (!built && axesParallel && sideNormal)
             {
-                Debug.Log("parallel side side");
-                if (BuildSideSideParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc))
-                {
-                    DedupAndCompact(ref cc);
-                    cc.globalPenAxis = n;
-                    cc.globalPenDepth = depth;
-                    return cc.numContactPoints > 0;
-                }
+                built = BuildSideSideParallelManifold(in a, in b, aAxis, bAxis, n, depth, ref cc);
             }
 
-            // ---------------------------
-            // 2.5) SKEW SIDE–SIDE (general non-parallel)
-            // Robust gate: closest points are interior on BOTH axes.
-            // Emits EXACTLY 1 contact.
-            // ---------------------------
-            if (!axesParallel)
+            // ------------------------------------------------------------
+            // 3) CAP–SIDE (closest-points classifier)
+            // ------------------------------------------------------------
+            if (!built)
             {
-                Debug.Log("skew side side");
-
-                if (TryBuildSideSideSkewSinglePoint_NeverFail(in a, in b, aAxis, bAxis, n, depth, ref cc))
-                {
-                    DedupAndCompact(ref cc);
-                    cc.globalPenAxis = n;
-                    cc.globalPenDepth = depth;
-                    return cc.numContactPoints > 0;
-                }
+                built = TryBuildCapSide_FromClosestPoints(in a, in b, aAxis, bAxis, n, depth, ref cc);
             }
 
-            // ---------------------------
-            // 3) CAP–SIDE EDGE @ ~90° (THIS MUST RUN BEFORE CONVEX FALLBACK)
-            // Emits EXACTLY 2 points (min/max bounds of intersecting edge)
-            // ---------------------------
-            // We want a forgiving "near 90°" test. (Adjust window if needed.)
-            bool axesPerp = axesDot < 0.05f;
-
-            if (axesPerp)
+            // ------------------------------------------------------------
+            // 3.5) RIM–CAP (both orderings)
+            // ------------------------------------------------------------
+            if (!built)
             {
-                // Try A cap vs B side
-                if (TryBuildCapSideEdge(in a, in b, aAxis, bAxis, n, depth, ref cc))
-                {
-                    DedupAndCompact(ref cc);
-                    cc.globalPenAxis = n;
-                    cc.globalPenDepth = depth;
-                    return cc.numContactPoints > 0; // IMPORTANT: prevent 4-pt convex fallback
-                }
-
-                // Try B cap vs A side
-                if (TryBuildCapSideEdge(in b, in a, bAxis, aAxis, n, depth, ref cc))
-                {
-                    DedupAndCompact(ref cc);
-                    cc.globalPenAxis = n;
-                    cc.globalPenDepth = depth;
-                    return cc.numContactPoints > 0; // IMPORTANT: prevent 4-pt convex fallback
-                }
+                built = TryBuildEdgeCapRim(in a, in b, aAxis, bAxis, n, depth, ref cc);
             }
 
-            // ---------------------------
-            // 3.5) EDGE-RIM vs CAP (circular rim intersects other cap disk)
-            // Emits 1 or 2 points (circle-plane line intersection, clipped to disk)
-            // Must run before convex fallback.
-            // ---------------------------
+            if (!built)
             {
-                // A rim vs B cap
-                if (TryBuildEdgeCapRim(in a, in b, aAxis, bAxis, n, depth, ref cc))
-                {
-                    DedupAndCompact(ref cc);
-                    cc.globalPenAxis = n;
-                    cc.globalPenDepth = depth;
-                    return cc.numContactPoints > 0;
-                }
-
-                // B rim vs A cap
-                if (TryBuildEdgeCapRim(in b, in a, bAxis, aAxis, n, depth, ref cc))
-                {
-                    DedupAndCompact(ref cc);
-                    cc.globalPenAxis = n;
-                    cc.globalPenDepth = depth;
-                    return cc.numContactPoints > 0;
-                }
+                built = TryBuildEdgeCapRim(in b, in a, bAxis, aAxis, n, depth, ref cc);
             }
 
-            // ---------------------------
-            // 4) FALLBACK: generic convex-style reduction
-            // (This can emit up to 4 — by design.)
-            // ---------------------------
-            BuildManifold_ConvexStyle(in a, in b, aAxis, bAxis, n, depth, ref cc);
+            // ------------------------------------------------------------
+            // 2.5) SKEW SIDE–SIDE
+            // ------------------------------------------------------------
+            if (!built && !axesParallel && sideNormal)
+            {
+                built = TryBuildSideSideSkewSinglePoint_NeverFail(in a, in b, aAxis, bAxis, n, depth, ref cc);
+            }
 
+            // ------------------------------------------------------------
+            // 4) FALLBACK
+            // ------------------------------------------------------------
+            if (!built)
+            {
+                BuildManifold_ConvexStyle(in a, in b, aAxis, bAxis, n, depth, ref cc);
+                built = cc.numContactPoints > 0;
+            }
+
+            // ------------------------------------------------------------
+            // FINALIZE (always run)
+            // ------------------------------------------------------------
+            if (!built)
+                return false;
+
+            // Keep SAT axis/depth stable, but fix points so they are inside BOTH volumes.
             DedupAndCompact(ref cc);
+            RepairAndFilterManifold(in a, in b, aAxis, bAxis, ref cc);
+
             cc.globalPenAxis = n;
             cc.globalPenDepth = depth;
+
+            ForcePointsOnCylinderA_AndFixNormals(in a, aAxis, n, ref cc);
+
+            // optional: small dedup again since projection can collapse points
+            DedupAndCompact(ref cc);
+
             return cc.numContactPoints > 0;
         }
+
+
+        private static bool TryBuildCapSide_FromClosestPoints(
+    in Cylinder a, in Cylinder b,
+    float3 aAxis, float3 bAxis,
+    float3 nAB, float satDepth,
+    ref CylinderCylinderContactPoints cc)
+        {
+            // Closest points between finite axis segments
+            float3 a0 = a.center - aAxis * a.halfHeight;
+            float3 a1 = a.center + aAxis * a.halfHeight;
+            float3 b0 = b.center - bAxis * b.halfHeight;
+            float3 b1 = b.center + bAxis * b.halfHeight;
+
+            ClosestPoints_SegmentSegment(a0, a1, b0, b1, out float3 pA, out float3 pB);
+
+            float hA = math.dot(pA - a.center, aAxis);
+            float hB = math.dot(pB - b.center, bAxis);
+
+            // scale-aware "near cap" margin
+            float mA = math.max(1e-4f, 0.03f * a.radius);
+            float mB = math.max(1e-4f, 0.03f * b.radius);
+
+            bool aNearCap = math.abs(hA) > (a.halfHeight - mA);
+            bool bNearCap = math.abs(hB) > (b.halfHeight - mB);
+
+            // We want exactly one cap involved (cap-side). If both caps involved, it's edge/cap-cap-ish.
+            if (aNearCap == bNearCap)
+                return false;
+
+            // Select cap cyl + side cyl
+            Cylinder capCyl, sideCyl;
+            float3 capAxis, sideAxis;
+            float hCap;
+
+            if (aNearCap)
+            {
+                capCyl = a; sideCyl = b;
+                capAxis = aAxis; sideAxis = bAxis;
+                hCap = hA;
+            }
+            else
+            {
+                capCyl = b; sideCyl = a;
+                capAxis = bAxis; sideAxis = aAxis;
+                hCap = hB;
+            }
+
+            // Pick the actual cap face by the sign of the closest-point axial coordinate
+            float s = (hCap >= 0f) ? +1f : -1f;
+            float3 capCenter = capCyl.center + capAxis * (s * capCyl.halfHeight);
+            float3 capNormalOut = capAxis * s;
+
+            // Now build 2-point edge segment on the SIDE cylinder, clipped to the CAP disk
+            return BuildCapSide_EdgeSegment_TwoPoints(
+                in capCyl, capCenter, capNormalOut,
+                in sideCyl, sideAxis,
+                nAB, satDepth,
+                ref cc);
+        }
+
+        private static bool BuildCapSide_EdgeSegment_TwoPoints(
+    in Cylinder cap, float3 capCenter, float3 capNormalOut,
+    in Cylinder side, float3 sideAxis,
+    float3 nAB, float satDepth,
+    ref CylinderCylinderContactPoints cc)
+        {
+            // Cap plane basis
+            BuildStableOrthoBasis(capNormalOut, out float3 u, out float3 v);
+
+            // True inward direction on SIDE surface: project -capNormalOut into side radial plane
+            float3 inwardDir = -capNormalOut;
+            inwardDir -= sideAxis * math.dot(inwardDir, sideAxis);
+            float lenSq = math.lengthsq(inwardDir);
+            if (lenSq < 1e-12f)
+                return false;
+
+            inwardDir *= math.rsqrt(lenSq);
+
+            // Line on side surface (generatrix):
+            // P(t) = side.center + sideAxis*t + inwardDir*side.radius
+            float3 baseP = side.center + inwardDir * side.radius;
+
+            // Express in cap plane coords: (x(t), y(t)) = (x0,y0) + t*(dx,dy)
+            float3 rel0 = baseP - capCenter;
+            float x0 = math.dot(rel0, u);
+            float y0 = math.dot(rel0, v);
+
+            float dx = math.dot(sideAxis, u);
+            float dy = math.dot(sideAxis, v);
+
+            float R = cap.radius;
+
+            // Quadratic for intersection with disk: (x0+dx*t)^2 + (y0+dy*t)^2 <= R^2
+            float A = dx * dx + dy * dy;
+            float B = 2f * (x0 * dx + y0 * dy);
+            float C = (x0 * x0 + y0 * y0) - R * R;
+
+            float tMinDisk, tMaxDisk;
+
+            if (A < 1e-12f)
+            {
+                if (C > 1e-6f) return false; // outside disk
+                tMinDisk = -side.halfHeight;
+                tMaxDisk = +side.halfHeight;
+            }
+            else
+            {
+                float disc = B * B - 4f * A * C;
+                if (disc < 0f) return false;
+
+                float sqrtDisc = math.sqrt(math.max(0f, disc));
+                float inv2A = 0.5f / A;
+
+                float r0 = (-B - sqrtDisc) * inv2A;
+                float r1 = (-B + sqrtDisc) * inv2A;
+                if (r1 < r0) { float tmp = r0; r0 = r1; r1 = tmp; }
+
+                tMinDisk = r0;
+                tMaxDisk = r1;
+            }
+
+            // Clip to finite cylinder height
+            float t0 = math.max(tMinDisk, -side.halfHeight);
+            float t1 = math.min(tMaxDisk, +side.halfHeight);
+            if (t1 < t0) return false;
+
+            float3 p0 = baseP + sideAxis * t0;
+            float3 p1 = baseP + sideAxis * t1;
+
+            cc = default;
+            InvalidateAll(ref cc);
+
+            // Emit 2 points if segment; 1 if tangent
+            if ((t1 - t0) < 1e-6f)
+            {
+                ContactPoint cp;
+                cp.point = p0;
+                cp.normal = nAB;
+                cp.depth = satDepth;
+
+                Write(ref cc, 0, cp);
+                cc.numContactPoints = 1;
+            }
+            else
+            {
+                ContactPoint cp0; cp0.point = p0; cp0.normal = nAB; cp0.depth = satDepth;
+                ContactPoint cp1; cp1.point = p1; cp1.normal = nAB; cp1.depth = satDepth;
+
+                Write(ref cc, 0, cp0);
+                Write(ref cc, 1, cp1);
+                cc.numContactPoints = 2;
+            }
+
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = satDepth;
+            return true;
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool InsideBoth(
+    in Cylinder a, float3 aAxis,
+    in Cylinder b, float3 bAxis,
+    float3 p)
+        {
+            float eps = math.max(1e-4f, 1e-3f * math.min(a.radius, b.radius));
+            return PointInsideFiniteCylinder(in a, aAxis, p, eps) &&
+                   PointInsideFiniteCylinder(in b, bAxis, p, eps);
+        }
+
+
 
         // Drop-in replacement for your skew side-side builder.
         // Emits exactly 1 CP on the CORRECT (penetrating) rim.
@@ -235,7 +370,24 @@ namespace Shard.Dev
             float3 a1 = a.center + aAxis * a.halfHeight;
             float3 b0 = b.center - bAxis * b.halfHeight;
             float3 b1 = b.center + bAxis * b.halfHeight;
-            ClosestPoints_SegmentSegment(a0, a1, b0, b1, out _, out float3 pB);
+
+            ClosestPoints_SegmentSegment(a0, a1, b0, b1, out float3 pA, out float3 pB);
+
+            // ------------------------------------------------------------
+            // HARD GATE: true side-side requires closest points to be
+            // well inside BOTH finite cylinders (not near caps)
+            // ------------------------------------------------------------
+            {
+                float hA = math.dot(pA - a.center, aAxis);
+                float hB = math.dot(pB - b.center, bAxis);
+
+                // Scale-aware margins (important!)
+                float marginA = math.max(1e-4f, 0.02f * a.radius);
+                float marginB = math.max(1e-4f, 0.02f * b.radius);
+
+                if (math.abs(hA) > a.halfHeight - marginA) return false;
+                if (math.abs(hB) > b.halfHeight - marginB) return false;
+            }
 
             // Basis for B radial plane
             BuildStableOrthoBasis(bAxis, out float3 uB, out float3 vB);
@@ -263,39 +415,25 @@ namespace Shard.Dev
             // Otherwise, we want the deepest point on THIS rim circle that is still inside A.
             // Approx: clamp to the rim-circle point that lies on the plane dot(x,d)=k,
             // where k is A's support value in direction d at that slice height.
-            //
-            // We approximate k using A's support point in direction d (closed-form support for finite cylinder).
             float3 xSupA = SupportFiniteCylinder_NoRot(in a, aAxis, d);
             float k = math.dot(xSupA, d);
 
-            // We need a point on the B rim circle maximizing dot(p,d) but <= k.
-            // For a circle, dot(p(θ),d) = dot(C,d) + b.radius * dot(rimDir(θ), d_rad)
-            // Max is at r, but if it violates <=k, we slide back along the circle to satisfy equality.
             float Cdot = math.dot(pB, d);
-            float maxDot = Cdot + b.radius * math.dot(r, d); // since rimDir=r at max
-                                                             // Note dot(r,d) == |proj(d)|, positive
-
+            float maxDot = Cdot + b.radius * math.dot(r, d);
             float target = math.min(maxDot, k);
 
-            // Solve for rimDir on circle such that dot(pB + b.radius*rimDir, d) = target
-            // => dot(rimDir, d) = (target - Cdot)/b.radius
+            // Solve dot(rimDir, d) = (target - Cdot)/b.radius
             float rhs = (target - Cdot) / math.max(b.radius, 1e-20f);
 
-            // Express rimDir = uB*c + vB*s. Then dot(rimDir,d)=c*dot(uB,d)+s*dot(vB,d).
+            // rimDir = uB*c + vB*s
             float A1 = math.dot(uB, d);
             float B1 = math.dot(vB, d);
             float L = math.sqrt(A1 * A1 + B1 * B1);
             if (L < 1e-12f) return false;
 
-            // Normalize: let A1'=A1/L, B1'=B1/L. Then c*A1'+s*B1' = rhs/L.
             float rhsN = rhs / L;
-
-            // Clamp: if rhsN < -1 or > 1, no intersection (fallback)
             rhsN = math.clamp(rhsN, -1f, 1f);
 
-            // Solutions on unit circle:
-            // Choose the solution closest to the unconstrained max direction (which is along (A1,B1))
-            // Param form: [c,s] = rhsN*[A1',B1'] ± sqrt(1-rhsN^2)*[-B1',A1']
             float A1n = A1 / L;
             float B1n = B1 / L;
 
@@ -304,7 +442,6 @@ namespace Shard.Dev
             float2 sol0 = new float2(rhsN * A1n - t * B1n, rhsN * B1n + t * A1n);
             float2 sol1 = new float2(rhsN * A1n + t * B1n, rhsN * B1n - t * A1n);
 
-            // Unconstrained max in (c,s) space is proportional to (A1,B1) => (A1n,B1n)
             float dot0 = sol0.x * A1n + sol0.y * B1n;
             float dot1 = sol1.x * A1n + sol1.y * B1n;
             float2 bestCS = (dot0 >= dot1) ? sol0 : sol1;
@@ -312,7 +449,6 @@ namespace Shard.Dev
             float3 rimDirBest = uB * bestCS.x + vB * bestCS.y;
             float3 pClamped = pB + rimDirBest * b.radius;
 
-            // Final sanity: make sure it's inside A; if caps break this approximation, just bail.
             if (!PointInsideFiniteCylinder(in a, aAxis, pClamped, 1e-5f))
                 return false;
 
@@ -371,10 +507,10 @@ namespace Shard.Dev
         #region Edge intersects Cap
 
         private static bool TryBuildEdgeCapRim(
-            in Cylinder edgeCyl, in Cylinder capCyl,
-            float3 edgeAxis, float3 capAxis,
-            float3 nAB, float satDepth,
-            ref CylinderCylinderContactPoints cc)
+    in Cylinder edgeCyl, in Cylinder capCyl,
+    float3 edgeAxis, float3 capAxis,
+    float3 nAB, float satDepth,
+    ref CylinderCylinderContactPoints cc)
         {
             // We want nEdge pointing EDGE -> CAP to choose the facing rim.
             float3 nEdge = nAB;
@@ -396,7 +532,6 @@ namespace Shard.Dev
             // ------------------------------------------------------------
             // 1) Deepest rim point relative to the cap plane
             // ------------------------------------------------------------
-            // Project cap normal into rim plane to get "in-plane" direction.
             float3 q = capNormalOut - edgeRimNormal * math.dot(capNormalOut, edgeRimNormal);
             float qLenSq = math.lengthsq(q);
 
@@ -407,27 +542,52 @@ namespace Shard.Dev
                 // Deepest rim point is opposite q (most negative plane distance)
                 float3 pDeep = edgeRimCenter - q * edgeCyl.radius;
 
-                // Test by projection into cap disk (NOT "must be on plane")
                 if (ProjectsInsideCapDisk(pDeep, capCenter, capNormalOut, capCyl.radius))
                 {
-                    return EmitEdgeCapContactFromRimPoint(
-                        pDeep, capCenter, capNormalOut, nAB, satDepth, ref cc);
+                    // --- emit from rim point, but choose a point that is inside BOTH ---
+                    float sd = math.dot(pDeep - capCenter, capNormalOut);
+                    float3 pCap = pDeep - capNormalOut * sd;
+                    float3 shared = 0.5f * (pDeep + pCap);
+
+                    float3 chosen = shared;
+
+                    if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, chosen))
+                    {
+                        if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pDeep))
+                            chosen = pDeep;
+                        else if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pCap))
+                            chosen = pCap;
+                        else
+                            goto STEP2; // no valid point from this candidate
+                    }
+
+                    cc = default;
+                    InvalidateAll(ref cc);
+
+                    ContactPoint cp;
+                    cp.point = chosen;
+                    cp.normal = nAB;
+                    cp.depth = satDepth;
+
+                    Write(ref cc, 0, cp);
+                    cc.numContactPoints = 1;
+                    cc.globalPenAxis = nAB;
+                    cc.globalPenDepth = satDepth;
+                    return true;
                 }
             }
 
+        STEP2:
             // ------------------------------------------------------------
-            // 2) Otherwise: rim circle intersects cap plane -> 0/1/2 points.
-            // Pick a valid endpoint whose projection lies in the disk.
+            // 2) Rim circle intersects cap plane -> pick a valid endpoint
             // ------------------------------------------------------------
             float3 lineDir = math.cross(edgeRimNormal, capNormalOut);
             float lineDirLenSq = math.lengthsq(lineDir);
             if (lineDirLenSq < 1e-12f)
                 return false;
 
-            float3 l = math.cross(edgeRimNormal, capNormalOut);
-            float lLenSq = math.lengthsq(l);
-            if (lLenSq < 1e-12f)
-                return false;
+            float3 l = lineDir;
+            float lLenSq = lineDirLenSq;
 
             float d0 = math.dot(edgeRimNormal, edgeRimCenter);
             float d1 = math.dot(capNormalOut, capCenter);
@@ -442,7 +602,7 @@ namespace Shard.Dev
             float3 m = x0 - edgeRimCenter;
             float B = 2f * math.dot(lineDir, m);
             float C = math.dot(m, m) - edgeCyl.radius * edgeCyl.radius;
-            float disc = B * B - 4f * C; // A=1 (lineDir normalized)
+            float disc = B * B - 4f * C; // A=1
 
             if (disc < 0f)
                 return false;
@@ -460,8 +620,7 @@ namespace Shard.Dev
             if (!okA && !okB)
                 return false;
 
-            // Prefer the endpoint with smallest signed distance (most "behind"),
-            // but DO NOT require it to be negative (these are often ~0).
+            // Prefer endpoint with smallest signed distance (most "behind")
             float bestSd = float.PositiveInfinity;
             float3 bestP = default;
 
@@ -476,9 +635,40 @@ namespace Shard.Dev
                 if (sd < bestSd) { bestSd = sd; bestP = pB; }
             }
 
-            return EmitEdgeCapContactFromRimPoint(
-                bestP, capCenter, capNormalOut, nAB, satDepth, ref cc);
+            // --- emit from bestP, but choose a point that is inside BOTH ---
+            {
+                float sd = math.dot(bestP - capCenter, capNormalOut);
+                float3 pCap = bestP - capNormalOut * sd;
+                float3 shared = 0.5f * (bestP + pCap);
+
+                float3 chosen = shared;
+
+                if (!InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, chosen))
+                {
+                    if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, bestP))
+                        chosen = bestP;
+                    else if (InsideBoth(in edgeCyl, edgeAxis, in capCyl, capAxis, pCap))
+                        chosen = pCap;
+                    else
+                        return false;
+                }
+
+                cc = default;
+                InvalidateAll(ref cc);
+
+                ContactPoint cp;
+                cp.point = chosen;
+                cp.normal = nAB;
+                cp.depth = satDepth;
+
+                Write(ref cc, 0, cp);
+                cc.numContactPoints = 1;
+                cc.globalPenAxis = nAB;
+                cc.globalPenDepth = satDepth;
+                return true;
+            }
         }
+
 
         #region Side-side non-perpendicular intersection
         private static bool TryBuildSideSideSkewSinglePoint(
@@ -629,37 +819,17 @@ namespace Shard.Dev
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool EmitEdgeCapContactFromRimPoint(
-            float3 pRim,
-            float3 capCenter,
-            float3 capNormalOut,
-            float3 nAB,
-            float satDepth,
-            ref CylinderCylinderContactPoints cc)
+    float3 pRim,
+    float3 capCenter,
+    float3 capNormalOut,
+    float3 nAB,
+    float satDepth,
+    ref CylinderCylinderContactPoints cc)
         {
-            // Cap witness = projection of rim point onto cap plane along cap normal
-            float sd = math.dot(pRim - capCenter, capNormalOut);
-            float3 pCap = pRim - capNormalOut * sd;
-
-            // Stable shared point (matches your ContactPoint comment)
-            float3 shared = 0.5f * (pRim + pCap);
-
-            // Depth from witness separation along solver axis (fallback to SAT depth if tiny)
-            float dep = math.abs(math.dot(pCap - pRim, nAB));
-            if (dep <= kSlop) dep = satDepth;
-
-            cc = default;
-            InvalidateAll(ref cc);
-
-            ContactPoint cp;
-            cp.point = shared;
-            cp.normal = nAB;
-            cp.depth = dep;
-
-            Write(ref cc, 0, cp);
-            cc.numContactPoints = 1;
-            cc.globalPenAxis = nAB;
-            cc.globalPenDepth = math.max(satDepth, dep);
-            return true;
+            // NOTE: we need the cylinders to validate points, so this function must
+            // be updated to take them OR we validate in the caller.
+            // If you prefer not to change signature, use the caller-validating version below.
+            throw new NotImplementedException("Use the caller-validating overload below.");
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -684,7 +854,6 @@ namespace Shard.Dev
             if (math.abs(math.dot(sideAxis, capAxis)) > 0.10f)
                 return false;
 
-            // IMPORTANT:
             // nCap must point CAP -> SIDE for cap selection + "deepest edge" direction.
             float3 nCap = nAB;
             float3 capToSide = sideCyl.center - capCyl.center;
@@ -699,31 +868,24 @@ namespace Shard.Dev
 
             // Build on deepest penetrating side edge (direction decided by capNormalOut)
             return BuildCapSide_DeepestPenetratingEdge_TwoPoints(
-                in capCyl, capCenter, capNormalOut,
+                in capCyl, capCenter, capAxis, capNormalOut,
                 in sideCyl, sideAxis,
-                nAB, satDepth,   // keep GLOBAL normal for cp.normal / solver direction
+                nAB, satDepth,
                 ref cc);
         }
 
         private static bool BuildCapSide_DeepestPenetratingEdge_TwoPoints(
-    in Cylinder cap, float3 capCenter, float3 capNormalOut,
+    in Cylinder cap, float3 capCenter, float3 capAxis, float3 capNormalOut,
     in Cylinder side, float3 sideAxis,
     float3 nAB, float satDepth,
     ref CylinderCylinderContactPoints cc)
         {
-            // Preconditions:
-            // - dot(sideAxis, capNormalOut) ~ 0 (side axis lies in cap plane)
-            // - capCenter is chosen cap center
-            // - capNormalOut points OUT of the cap face
-
             // Build in-plane basis for the cap plane:
-            // d = sideAxis projected into cap plane (should already be almost in plane)
             float3 d = sideAxis - capNormalOut * math.dot(sideAxis, capNormalOut);
             float dLenSq = math.lengthsq(d);
             if (dLenSq < kTiny) return false;
             d *= math.rsqrt(dLenSq);
 
-            // p = perpendicular in cap plane
             float3 p = math.cross(capNormalOut, d);
             float pLenSq = math.lengthsq(p);
             if (pLenSq < kTiny) return false;
@@ -732,88 +894,115 @@ namespace Shard.Dev
             // Signed distance of side axis (through side.center) to the cap plane along capNormalOut:
             float hOut = math.dot(side.center - capCenter, capNormalOut);
 
-            // The deepest penetrating edge of the side cylinder is the generatrix shifted
-            // into the cap by radius along -capNormalOut.
-            // Distance of that edge to the plane: distEdge = hOut - side.radius.
+            // Deepest penetrating generatrix edge distance to plane:
+            // distEdge = hOut - side.radius (negative means behind/in the cap plane)
             float distEdge = hOut - side.radius;
 
-            // If the deepest edge is not behind the cap plane, there is no cap penetration by that edge.
             if (distEdge >= -1e-6f)
                 return false;
 
-            // Deepest penetration magnitude relative to the cap plane (along capNormalOut).
-            float penDeepPlane = -distEdge; // = side.radius - hOut
-
-            // Project side axis line onto the cap plane (a point on the side axis in the cap plane):
-            // axisOnPlane = side.center - capNormalOut * hOut
+            // Project side axis onto cap plane
             float3 axisOnPlane = side.center - capNormalOut * hOut;
 
-            // In cap-plane coordinates relative to capCenter:
             float3 rel = axisOnPlane - capCenter;
-            float xAxis = math.dot(rel, p); // perpendicular-to-axis offset in plane
-            float yAxis = math.dot(rel, d); // along-axis offset in plane
+            float xAxis = math.dot(rel, p);
+            float yAxis = math.dot(rel, d);
 
             float R = cap.radius;
 
-            // Intersect the projected axis line with the cap disk:
-            // Condition: xAxis^2 + (yAxis + t)^2 <= R^2  where t is along d (and equals sideAxis param)
+            // Disk intersection in that plane
             float yMaxSq = R * R - xAxis * xAxis;
+            float3 inward = -capNormalOut;
+
+            // Tangent-ish: emit ONE point, but only if it's inside both.
             if (yMaxSq <= 1e-10f)
-                return false; // tangent / no segment => let fallback handle
+            {
+                float t = math.clamp(-yAxis, -side.halfHeight, +side.halfHeight);
+
+                float3 wSide = side.center + sideAxis * t + inward * side.radius;
+
+                if (!InsideBoth(in cap, capAxis, in side, sideAxis, wSide))
+                    return false;
+
+                float3 wCap = wSide - capNormalOut * distEdge;
+
+                float dep = math.abs(math.dot(wCap - wSide, nAB));
+                if (dep <= kSlop) dep = satDepth;
+                if (dep <= kSlop) return false;
+
+                cc = default;
+                InvalidateAll(ref cc);
+
+                ContactPoint cp;
+                cp.point = wSide;     // on penetrating edge feature
+                cp.normal = nAB;
+                cp.depth = dep;
+
+                Write(ref cc, 0, cp);
+                cc.numContactPoints = 1;
+                cc.globalPenAxis = nAB;
+                cc.globalPenDepth = math.max(satDepth, dep);
+                return true;
+            }
 
             float yMax = math.sqrt(yMaxSq);
 
-            // Solve |yAxis + t| <= yMax  =>  t in [-yAxis - yMax, -yAxis + yMax]
             float tMinDisk = -yAxis - yMax;
             float tMaxDisk = -yAxis + yMax;
 
-            // Clip by finite side height along sideAxis: t in [-hh, +hh]
             float t0 = math.max(tMinDisk, -side.halfHeight);
             float t1 = math.min(tMaxDisk, +side.halfHeight);
 
             if (t1 < t0 + 1e-7f)
                 return false;
 
-            // Build the two deepest-edge points ON THE SIDE CYLINDER (penetrating feature):
-            float3 inward = -capNormalOut;
             float3 wSide0 = side.center + sideAxis * t0 + inward * side.radius;
             float3 wSide1 = side.center + sideAxis * t1 + inward * side.radius;
 
-            // Corresponding points on the CAP FACE (cap plane) are the projection of the side points
-            // along capNormalOut back to the plane by distEdge (constant):
-            // Since distEdge = dot(wSide - capCenter, capNormalOut), the plane witness is:
+            // ---- NEW: endpoint validation ----
+            bool ok0 = InsideBoth(in cap, capAxis, in side, sideAxis, wSide0);
+            bool ok1 = InsideBoth(in cap, capAxis, in side, sideAxis, wSide1);
+
+            if (!ok0 && !ok1)
+                return false;
+
             float3 wCap0 = wSide0 - capNormalOut * distEdge;
             float3 wCap1 = wSide1 - capNormalOut * distEdge;
 
-            // Depth should be the deepest-edge penetration ALONG nAB (stable for solver push).
-            // Use witness difference along nAB (cap -> side), ensure positivity.
             float depth0 = math.abs(math.dot(wCap0 - wSide0, nAB));
             float depth1 = math.abs(math.dot(wCap1 - wSide1, nAB));
             float depth = math.max(depth0, depth1);
+            if (depth <= kSlop) return false;
 
-            // Numerical guard: if nAB is slightly off, fall back to plane penetration projected onto nAB.
-            //float depthFallback = penDeepPlane * math.max(0f, math.dot(capNormalOut, nAB));
-            //if (depth0 <= kSlop) depth0 = depthFallback;
-            //if (depth1 <= kSlop) depth1 = depthFallback;
-
-            //float depth = math.max(depth0, depth1);
-            if (depth <= kSlop)
-                return false;
-
-            // Emit exactly 2 contacts, points located ON the penetrating edge (wSide*).
             cc = default;
             InvalidateAll(ref cc);
 
-            ContactPoint cp0; cp0.point = wSide0; cp0.normal = nAB; cp0.depth = depth;
-            ContactPoint cp1; cp1.point = wSide1; cp1.normal = nAB; cp1.depth = depth;
+            int count = 0;
 
-            Write(ref cc, 0, cp0);
-            Write(ref cc, 1, cp1);
-            cc.numContactPoints = 2;
+            if (ok0)
+            {
+                ContactPoint cp0;
+                cp0.point = wSide0;
+                cp0.normal = nAB;
+                cp0.depth = depth;
+                Write(ref cc, count++, cp0);
+            }
+
+            if (ok1)
+            {
+                ContactPoint cp1;
+                cp1.point = wSide1;
+                cp1.normal = nAB;
+                cp1.depth = depth;
+                Write(ref cc, count++, cp1);
+            }
+
+            cc.numContactPoints = count;
             cc.globalPenAxis = nAB;
-            cc.globalPenDepth = math.max(satDepth, depth); // keep MTV at least as big as this feature depth
-            return true;
+            cc.globalPenDepth = math.max(satDepth, depth);
+            return count > 0;
         }
+
 
         private static bool BuildCapCapParallelManifold(
     in Cylinder a, in Cylinder b,
@@ -1387,6 +1576,97 @@ namespace Shard.Dev
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void ForcePointsOnCylinderA_AndFixNormals(
+    in Cylinder a, float3 aAxis,
+    float3 nAB,
+    ref CylinderCylinderContactPoints cc)
+        {
+            // nAB is already oriented A->B in Solve().
+            // Force every contact normal to match that convention.
+            // Force every contact point to lie ON A's finite cylinder surface.
+
+            if (cc.numContactPoints <= 0) return;
+
+            for (int i = 0; i < cc.numContactPoints; i++)
+            {
+                ContactPoint cp = cc[i];
+                if (cp.depth <= 0f) continue;
+
+                cp.normal = nAB;
+                cp.point = ProjectPointToFiniteCylinderSurface(in a, aAxis, cp.point, nAB);
+
+                Write(ref cc, i, cp);
+            }
+
+            cc.globalPenAxis = nAB;
+            // keep cc.globalPenDepth unchanged (SAT depth)
+        }
+
+        // Projects p to a *surface* point on A (side or cap) in a stable way,
+        // using nAB to decide the "facing" surface direction.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 ProjectPointToFiniteCylinderSurface(
+            in Cylinder c, float3 cAxis,
+            float3 p,
+            float3 nAB)
+        {
+            // Clamp axial coordinate first (finite cylinder)
+            float3 d = p - c.center;
+            float h = math.dot(d, cAxis);
+            h = math.clamp(h, -c.halfHeight, +c.halfHeight);
+
+            float3 baseP = c.center + cAxis * h;
+
+            // Decide whether we should snap to a CAP or the SIDE.
+            // Use how aligned the normal is with the axis as the classifier.
+            float axisAlign = math.abs(math.dot(nAB, cAxis));
+            bool preferCap = axisAlign > 0.85f; // tweakable; keeps cap manifolds on caps
+
+            // Radial component at this axial slice
+            float3 radial = p - baseP;
+            radial -= cAxis * math.dot(radial, cAxis);
+
+            if (preferCap)
+            {
+                // Cap: keep within disk, don't force to rim.
+                float rr = c.radius;
+                float rLenSq = math.lengthsq(radial);
+                if (rLenSq > rr * rr && rLenSq > 1e-20f)
+                    radial *= (rr * math.rsqrt(rLenSq));
+                return baseP + radial;
+            }
+            else
+            {
+                // Side: force to rim in the direction that faces B.
+                // Use the normal projected into the radial plane as the stable rim direction.
+                float3 rimDir = nAB - cAxis * math.dot(nAB, cAxis);
+                float rimLenSq = math.lengthsq(rimDir);
+
+                if (rimLenSq < 1e-20f)
+                {
+                    // Fallback: use the existing radial direction if normal is axial-ish.
+                    float rLenSq = math.lengthsq(radial);
+                    if (rLenSq < 1e-20f)
+                    {
+                        // Degenerate: pick any perpendicular
+                        BuildStableOrthoBasis(cAxis, out float3 u, out _);
+                        rimDir = u;
+                    }
+                    else
+                    {
+                        rimDir = radial * math.rsqrt(rLenSq);
+                    }
+                }
+                else
+                {
+                    rimDir *= math.rsqrt(rimLenSq);
+                }
+
+                return baseP + rimDir * c.radius;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float Cross2(float2 a, float2 b) => a.x * b.y - a.y * b.x;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1459,6 +1739,101 @@ namespace Shard.Dev
 
             u = math.normalize(u);
             v = math.normalize(v);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 ClampPointToFiniteCylinderVolume(in Cylinder c, float3 cAxis, float3 p)
+        {
+            float3 d = p - c.center;
+
+            // clamp axial
+            float h = math.dot(d, cAxis);
+            h = math.clamp(h, -c.halfHeight, +c.halfHeight);
+            float3 axisPt = c.center + cAxis * h;
+
+            // clamp radial
+            float3 r = p - axisPt;
+            r -= cAxis * math.dot(r, cAxis);
+            float rLenSq = math.lengthsq(r);
+
+            if (rLenSq > 1e-20f)
+            {
+                float rLen = math.sqrt(rLenSq);
+                if (rLen > c.radius)
+                    r *= (c.radius / rLen);
+            }
+            else
+            {
+                r = float3.zero;
+            }
+
+            return axisPt + r;
+        }
+
+        private static float3 RepairSharedPointInsideBoth(
+            in Cylinder a, float3 aAxis,
+            in Cylinder b, float3 bAxis,
+            float3 p)
+        {
+            // 2-3 iterations is enough; this is like alternating projections.
+            for (int i = 0; i < 3; i++)
+            {
+                float3 aP = ClampPointToFiniteCylinderVolume(in a, aAxis, p);
+                float3 bP = ClampPointToFiniteCylinderVolume(in b, bAxis, p);
+                p = 0.5f * (aP + bP);
+            }
+            return p;
+        }
+
+        private static void RepairAndFilterManifold(
+            in Cylinder a, in Cylinder b,
+            float3 aAxis, float3 bAxis,
+            ref CylinderCylinderContactPoints cc)
+        {
+            float eps = math.max(1e-4f, 1e-3f * math.min(a.radius, b.radius));
+
+            Span<ContactPoint> pts = stackalloc ContactPoint[4];
+            int n = 0;
+
+            if (cc.p1.depth > 0f) pts[n++] = cc.p1;
+            if (cc.p2.depth > 0f) pts[n++] = cc.p2;
+            if (cc.p3.depth > 0f) pts[n++] = cc.p3;
+            if (cc.p4.depth > 0f) pts[n++] = cc.p4;
+
+            // repair + keep only valid
+            Span<ContactPoint> outPts = stackalloc ContactPoint[4];
+            int outCount = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                ContactPoint cp = pts[i];
+
+                // Repair to be inside both volumes
+                cp.point = RepairSharedPointInsideBoth(in a, aAxis, in b, bAxis, cp.point);
+
+                // Validate
+                if (!PointInsideFiniteCylinder(in a, aAxis, cp.point, eps)) continue;
+                if (!PointInsideFiniteCylinder(in b, bAxis, cp.point, eps)) continue;
+
+                outPts[outCount++] = cp;
+                if (outCount == 4) break;
+            }
+
+            // rewrite cc
+            float3 axis = cc.globalPenAxis;
+            float depth = cc.globalPenDepth;
+
+            cc = default;
+            InvalidateAll(ref cc);
+
+            if (outCount > 0) cc.p1 = outPts[0];
+            if (outCount > 1) cc.p2 = outPts[1];
+            if (outCount > 2) cc.p3 = outPts[2];
+            if (outCount > 3) cc.p4 = outPts[3];
+
+            cc.numContactPoints = outCount;
+            cc.globalPenAxis = axis;
+            cc.globalPenDepth = depth;
         }
 
         private static void DedupAndCompact(ref CylinderCylinderContactPoints cc)

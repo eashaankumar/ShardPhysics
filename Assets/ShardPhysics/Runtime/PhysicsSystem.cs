@@ -726,10 +726,10 @@ namespace Shard.Runtime
                 }
 
                 // flip manifold (solver gives box->cyl, we need A->B)
-                cps.globalPenAxis = -cps.globalPenAxis;
+                //cps.globalPenAxis = -cps.globalPenAxis;
 
-                for (int i = 0; i < cps.numContactPoints; i++)
-                    cps[i] = new ContactPoint { point = cps[i].point, normal = -cps[i].normal, depth = cps[i].depth };
+                //for (int i = 0; i < cps.numContactPoints; i++)
+                //    cps[i] = new ContactPoint { point = cps[i].point, normal = -cps[i].normal, depth = cps[i].depth };
 
                 return true;
             }
