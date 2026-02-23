@@ -304,13 +304,14 @@ namespace Shard.Dev
             return q;
         }
 
+
         private static bool TryBuildCapSide_FromClosestPoints(
     in Cylinder a, in Cylinder b,
     float3 aAxis, float3 bAxis,
     float3 nAB, float satDepth,
     ref CylinderCylinderContactPoints cc)
         {
-            // Closest points between finite axis segments
+            // Closest points between finite axis segments (used only to choose which cap face sign)
             float3 a0 = a.center - aAxis * a.halfHeight;
             float3 a1 = a.center + aAxis * a.halfHeight;
             float3 b0 = b.center - bAxis * b.halfHeight;
@@ -321,65 +322,73 @@ namespace Shard.Dev
             float hA = math.dot(pA - a.center, aAxis);
             float hB = math.dot(pB - b.center, bAxis);
 
-            // scale-aware "near cap" margin
-            float mA = math.max(1e-4f, 0.03f * a.radius);
-            float mB = math.max(1e-4f, 0.03f * b.radius);
+            // Use SAT normal alignment to decide which cylinder is more "cap-plane provider"
+            float aAlign = math.abs(math.dot(aAxis, nAB));
+            float bAlign = math.abs(math.dot(bAxis, nAB));
+            bool aIsMoreCapLike = aAlign >= bAlign;
 
-            bool aNearCap = math.abs(hA) > (a.halfHeight - mA);
-            bool bNearCap = math.abs(hB) > (b.halfHeight - mB);
-
-            // We want exactly one cap involved (cap-side). If both caps involved, it's edge/cap-cap-ish.
-            if (aNearCap == bNearCap)
-                return false;
-
-            // Select cap cyl + side cyl
-            Cylinder capCyl, sideCyl;
-            float3 capAxis, sideAxis;
-            float hCap;
-
-            if (aNearCap)
+            // Try the more cap-like ordering first, but NEVER hard-reject based on heuristics.
+            // If it fails, try the opposite ordering.
+            if (aIsMoreCapLike)
             {
-                capCyl = a; sideCyl = b;
-                capAxis = aAxis; sideAxis = bAxis;
-                hCap = hA;
+                if (TryBuildCapSide_Attempt(in a, in b, aAxis, bAxis, hA, nAB, satDepth, ref cc))
+                    return true;
+
+                if (TryBuildCapSide_Attempt(in b, in a, bAxis, aAxis, hB, nAB, satDepth, ref cc))
+                    return true;
             }
             else
             {
-                capCyl = b; sideCyl = a;
-                capAxis = bAxis; sideAxis = aAxis;
-                hCap = hB;
+                if (TryBuildCapSide_Attempt(in b, in a, bAxis, aAxis, hB, nAB, satDepth, ref cc))
+                    return true;
+
+                if (TryBuildCapSide_Attempt(in a, in b, aAxis, bAxis, hA, nAB, satDepth, ref cc))
+                    return true;
             }
 
-            // Pick the actual cap face by the sign of the closest-point axial coordinate
-            float s = (hCap >= 0f) ? +1f : -1f;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TryBuildCapSide_Attempt(
+            in Cylinder capCyl, in Cylinder sideCyl,
+            float3 capAxis, float3 sideAxis,
+            float hCapClosest,                 // axial coord of closest point on capCyl axis (used to choose cap face sign)
+            float3 nAB, float satDepth,
+            ref CylinderCylinderContactPoints cc)
+        {
+            // Pick the actual cap face by sign of closest axial coordinate
+            float s = (hCapClosest >= 0f) ? +1f : -1f;
             float3 capCenter = capCyl.center + capAxis * (s * capCyl.halfHeight);
             float3 capNormalOut = capAxis * s;
 
+            // If the side axis is parallel to cap plane, we want the 2-point edge-line intersection.
             bool areCapEdgeParallel = math.abs(math.dot(capNormalOut, sideAxis)) < 0.01f;
             if (areCapEdgeParallel)
             {
                 GetFacingEdgeLineTowardCap(
                     in sideCyl, sideAxis,
-                    capCyl.center,                // IMPORTANT: use cap cylinder CENTER for selecting the facing edge
+                    capCyl.center,                 // IMPORTANT: stable facing choice
                     out float3 O, out float3 D);
 
-                return BuildCapSide_EdgeParallel_TwoPoints_OnEdgeLine(
+                if (BuildCapSide_EdgeParallel_TwoPoints_OnEdgeLine(
                     in capCyl, capCenter, capNormalOut, capAxis,
                     in sideCyl, sideAxis,
                     O, D,
                     nAB, satDepth,
-                    ref cc);
+                    ref cc))
+                    return true;
+
+                // If the edge-parallel 2pt path fails (numerical/InsideBoth), fall through to 1pt regen.
             }
-            else
-            {
-                // Fallback to your existing one-point construction
-                return BuildCapSide_Regen_OnePoint(
-                    in capCyl, capCenter, capNormalOut, capAxis,
-                    in sideCyl, sideAxis,
-                    nAB, satDepth,
-                    ref cc);
-            }
+
+            return BuildCapSide_Regen_OnePoint(
+                in capCyl, capCenter, capNormalOut, capAxis,
+                in sideCyl, sideAxis,
+                nAB, satDepth,
+                ref cc);
         }
+
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void GetFacingEdgeLineTowardCap(
@@ -408,228 +417,114 @@ namespace Shard.Dev
             O = edgeCyl.center + rDir * edgeCyl.radius;
         }
 
-        
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-private static bool BuildCapSide_EdgeParallel_TwoPoints_OnEdgeLine(
-    in Cylinder capCyl, float3 capCenter, float3 capNormalOut, float3 capAxis,
-    in Cylinder edgeCyl, float3 edgeAxis,
-    float3 O, float3 D,                 // edge line: P(s)=O + D*s (D unit)
-    float3 nAB, float satDepth,
-    ref CylinderCylinderContactPoints cc)
-{
-    if (math.abs(math.dot(D, capNormalOut)) > 1e-6f)
-        return false;
-
-    float sd = math.dot(O - capCenter, capNormalOut);
-    float3 capCenterProj = capCenter + capNormalOut * sd;
-
-    BuildStableOrthoBasis(capNormalOut, out float3 u, out float3 v);
-
-    float3 OC = O - capCenterProj;
-    float2 o2 = new float2(math.dot(OC, u), math.dot(OC, v));
-    float2 d2 = new float2(math.dot(D, u), math.dot(D, v));
-    float d2LenSq = math.dot(d2, d2);
-    if (d2LenSq < 1e-12f) return false;
-
-    float inv = math.rsqrt(d2LenSq);
-    d2 *= inv; // so quadratic uses a=1 and s is in world units
-
-    float R = capCyl.radius;
-
-    float b = 2f * math.dot(o2, d2);
-    float c = math.dot(o2, o2) - R * R;
-
-    float disc = b * b - 4f * c;
-    if (disc < 0f)
-        return false;
-
-    float sDisc = math.sqrt(disc);
-    float s0 = (-b - sDisc) * 0.5f;
-    float s1 = (-b + sDisc) * 0.5f;
-    if (s1 < s0) { float t = s0; s0 = s1; s1 = t; }
-
-    float tMin = -edgeCyl.halfHeight;
-    float tMax = +edgeCyl.halfHeight;
-
-    float sEnter = math.max(s0, tMin);
-    float sExit  = math.min(s1, tMax);
-
-    if (sExit < sEnter - 1e-7f)
-        return false;
-
-    float3 p0 = O + D * sEnter; // ON EDGE LINE
-    float3 p1 = O + D * sExit;  // ON EDGE LINE
-
-    // If interval is healthy, do the normal 2-pt emit.
-    float segLen = sExit - sEnter;
-
-    // scale-aware collapse eps
-    float collapseEps = math.max(1e-5f, 1e-3f * math.min(capCyl.radius, edgeCyl.radius));
-
-    if (segLen > collapseEps)
-    {
-        bool ok0 = InsideBoth(in capCyl, capAxis, in edgeCyl, edgeAxis, p0);
-        bool ok1 = InsideBoth(in capCyl, capAxis, in edgeCyl, edgeAxis, p1);
-        if (!ok0 && !ok1) return false;
-
-        cc = default;
-        InvalidateAll(ref cc);
-
-        int count = 0;
-        if (ok0)
+        private static bool BuildCapSide_EdgeParallel_TwoPoints_OnEdgeLine(
+            in Cylinder capCyl, float3 capCenter, float3 capNormalOut, float3 capAxis,
+            in Cylinder edgeCyl, float3 edgeAxis,
+            float3 O, float3 D,                 // edge line: P(s)=O + D*s (D unit)
+            float3 nAB, float satDepth,
+            ref CylinderCylinderContactPoints cc)
         {
-            ContactPoint cp;
-            cp.point = p0;
-            cp.normal = nAB;
-            cp.depth = satDepth;
-            Write(ref cc, count++, cp);
-        }
-        if (ok1)
-        {
-            if (count == 0 || math.lengthsq(p1 - cc.p1.point) > 1e-12f)
+            // Must be (nearly) parallel to the cap plane for this subcase.
+            if (math.abs(math.dot(D, capNormalOut)) > 1e-6f)
+                return false;
+
+            // Segment parameter range on the edge generatrix
+            float tMin = -edgeCyl.halfHeight;
+            float tMax = +edgeCyl.halfHeight;
+
+            // -----------------------------------------------------------------
+            // Work in the CAP PLANE: project the line origin onto the cap plane.
+            // Since D is parallel to the plane, projection preserves the parameter s.
+            // -----------------------------------------------------------------
+            float sd = math.dot(O - capCenter, capNormalOut);
+            float3 Oplane = O - capNormalOut * sd; // now lies in cap plane
+
+            // Closest parameter on the INFINITE line (in plane) to capCenter
+            float sInf = math.dot(capCenter - Oplane, D); // D unit
+
+            // Clamp to finite segment first (THIS is the key fix)
+            float sClosest = math.clamp(sInf, tMin, tMax);
+            float3 pClosestPlane = Oplane + D * sClosest;
+
+            // Distance from closest point on segment to disk center (in cap plane)
+            float3 v = pClosestPlane - capCenter;
+            v -= capNormalOut * math.dot(v, capNormalOut); // should be ~0, but keep it clean
+            float distSq = math.lengthsq(v);
+
+            float R = capCyl.radius;
+            float R2 = R * R;
+
+            // If even the closest point on the segment is outside the disk, there is NO overlap.
+            // (In that case you should NOT fabricate points; it isn't cap-side coplanar overlap.)
+            // Keep a small epsilon for numerical robustness.
+            float diskEps = math.max(1e-6f, 1e-4f * math.min(capCyl.radius, edgeCyl.radius));
+            if (distSq > R2 + diskEps)
+                return false;
+
+            // Half-chord length along the line around the closest point
+            float h = math.sqrt(math.max(0f, R2 - distSq));
+
+            // Unclamped overlap interval on the infinite line
+            float s0 = sInf - h;
+            float s1 = sInf + h;
+            if (s1 < s0) { float tmp = s0; s0 = s1; s1 = tmp; }
+
+            // Clamp overlap interval to the finite segment ALWAYS
+            float sEnter = math.clamp(s0, tMin, tMax);
+            float sExit = math.clamp(s1, tMin, tMax);
+
+            // Ensure ordering after clamp
+            if (sExit < sEnter) { float tmp = sEnter; sEnter = sExit; sExit = tmp; }
+
+            // These are ALWAYS on the EDGE LINE (not off to the side)
+            float3 p0 = O + D * sEnter;
+            float3 p1 = O + D * sExit;
+
+            // -----------------------------------------------------------------
+            // Enforce they are in the cap disk (numerical safety) WITHOUT moving off the line:
+            // We only "repair" by sliding along the line toward the closest point if needed.
+            // -----------------------------------------------------------------
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            static bool InDisk_OnPlane(float3 p, float3 c, float3 n, float R, float eps)
             {
-                ContactPoint cp;
-                cp.point = p1;
-                cp.normal = nAB;
-                cp.depth = satDepth;
-                Write(ref cc, count++, cp);
+                float3 d = (p - c) - n * math.dot(p - c, n);
+                return math.lengthsq(d) <= R * R + eps;
             }
+
+            float diskEps2 = diskEps * 2f;
+
+            // If endpoints barely drifted out due to sd projection mismatch, pull them toward sClosest.
+            if (!InDisk_OnPlane(Oplane + D * sEnter, capCenter, capNormalOut, R, diskEps2))
+                sEnter = sClosest;
+            if (!InDisk_OnPlane(Oplane + D * sExit, capCenter, capNormalOut, R, diskEps2))
+                sExit = sClosest;
+
+            p0 = O + D * sEnter;
+            p1 = O + D * sExit;
+
+            // -----------------------------------------------------------------
+            // ALWAYS output the two clamped points.
+            // Your "inside both" rule should hold automatically here:
+            // - Points are on the edge cylinder surface/segment by construction.
+            // - Points are inside the cap disk by construction and lie on the cap plane.
+            // -----------------------------------------------------------------
+            cc = default;
+            InvalidateAll(ref cc);
+
+            ContactPoint cp0; cp0.point = p0; cp0.normal = nAB; cp0.depth = satDepth;
+            ContactPoint cp1; cp1.point = p1; cp1.normal = nAB; cp1.depth = satDepth;
+
+            Write(ref cc, 0, cp0);
+            Write(ref cc, 1, cp1);
+            cc.numContactPoints = 2;
+
+            // If they collapse (tangent / fully clamped), keep both; your DedupAndCompact() will reduce.
+            cc.globalPenAxis = nAB;
+            cc.globalPenDepth = satDepth;
+            return true;
         }
-
-        cc.numContactPoints = count;
-        cc.globalPenAxis = nAB;
-        cc.globalPenDepth = satDepth;
-        return count > 0;
-    }
-
-    // -----------------------------------------------------------------
-    // STABILIZING FALLBACK for collapsed interval:
-    // Keep 2 points on the EDGE SEGMENT as long as possible.
-    // -----------------------------------------------------------------
-
-    // Helper: is a point on the edge line inside the projected cap disk?
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static bool InsideProjectedDisk(float3 p, float3 cProj, float3 n, float R)
-    {
-        float3 inPlane = (p - cProj) - n * math.dot(p - cProj, n);
-        return math.lengthsq(inPlane) <= R * R + 1e-6f;
-    }
-
-    // 1) Prefer endpoints if they are valid (most stable)
-    float3 pMin = O + D * tMin;
-    float3 pMax = O + D * tMax;
-
-    bool okMin =
-        InsideProjectedDisk(pMin, capCenterProj, capNormalOut, R) &&
-        InsideBoth(in capCyl, capAxis, in edgeCyl, edgeAxis, pMin);
-
-    bool okMax =
-        InsideProjectedDisk(pMax, capCenterProj, capNormalOut, R) &&
-        InsideBoth(in capCyl, capAxis, in edgeCyl, edgeAxis, pMax);
-
-    if (okMin && okMax)
-    {
-        cc = default;
-        InvalidateAll(ref cc);
-
-        ContactPoint cp0; cp0.point = pMin; cp0.normal = nAB; cp0.depth = satDepth;
-        ContactPoint cp1; cp1.point = pMax; cp1.normal = nAB; cp1.depth = satDepth;
-
-        Write(ref cc, 0, cp0);
-        Write(ref cc, 1, cp1);
-
-        cc.numContactPoints = 2;
-        cc.globalPenAxis = nAB;
-        cc.globalPenDepth = satDepth;
-        return true;
-    }
-
-    // 2) Otherwise, build a 2-point pair around the closest-on-line point to the disk center.
-    // Closest parameter on the infinite line to the projected center:
-    float sClosest = math.dot(capCenterProj - O, D); // D unit
-    sClosest = math.clamp(sClosest, tMin, tMax);
-
-    float3 pC = O + D * sClosest;
-
-    // If even closest point isn't inside projected disk, there is no meaningful overlap.
-    if (!InsideProjectedDisk(pC, capCenterProj, capNormalOut, R))
-        return false;
-
-    // Choose a small separation within segment bounds.
-    float sep = math.max(1e-4f, 0.05f * math.min(capCyl.radius, edgeCyl.radius));
-
-    float sA = math.clamp(sClosest - sep, tMin, tMax);
-    float sB = math.clamp(sClosest + sep, tMin, tMax);
-
-    // If clamping collapses them, push to opposite endpoint if possible.
-    if (math.abs(sB - sA) < 1e-8f)
-    {
-        float other = (sClosest - tMin > tMax - sClosest) ? tMin : tMax;
-        sA = sClosest;
-        sB = other;
-    }
-
-    float3 q0 = O + D * sA;
-    float3 q1 = O + D * sB;
-
-    // Validate inside both (your rule); also keep them in projected disk if possible.
-    bool q0Ok = InsideProjectedDisk(q0, capCenterProj, capNormalOut, R) && InsideBoth(in capCyl, capAxis, in edgeCyl, edgeAxis, q0);
-    bool q1Ok = InsideProjectedDisk(q1, capCenterProj, capNormalOut, R) && InsideBoth(in capCyl, capAxis, in edgeCyl, edgeAxis, q1);
-
-    if (!q0Ok && !q1Ok)
-        return false;
-
-    cc = default;
-    InvalidateAll(ref cc);
-
-    int outCount = 0;
-
-    if (q0Ok)
-    {
-        ContactPoint cp;
-        cp.point = q0;
-        cp.normal = nAB;
-        cp.depth = satDepth;
-        Write(ref cc, outCount++, cp);
-    }
-
-    if (q1Ok)
-    {
-        if (outCount == 0 || math.lengthsq(q1 - cc.p1.point) > 1e-12f)
-        {
-            ContactPoint cp;
-            cp.point = q1;
-            cp.normal = nAB;
-            cp.depth = satDepth;
-            Write(ref cc, outCount++, cp);
-        }
-    }
-
-    // If only one survived, try to salvage a second by using the far endpoint (still on line).
-    if (outCount == 1)
-    {
-        float3 far = (math.lengthsq(q0 - pMin) + math.lengthsq(q0 - pMax) > math.lengthsq(q1 - pMin) + math.lengthsq(q1 - pMax))
-            ? pMin : pMax;
-
-        // Only require InsideBoth here (disk check can fail near end-caps, but the contact is still stabilizing)
-        if (InsideBoth(in capCyl, capAxis, in edgeCyl, edgeAxis, far) &&
-            math.lengthsq(far - cc.p1.point) > 1e-10f)
-        {
-            ContactPoint cp;
-            cp.point = far;
-            cp.normal = nAB;
-            cp.depth = satDepth;
-            Write(ref cc, outCount++, cp);
-        }
-    }
-
-    cc.numContactPoints = outCount;
-    cc.globalPenAxis = nAB;
-    cc.globalPenDepth = satDepth;
-
-    return outCount > 0;
-}
-
 
 
         // Coplanar case: segment-circle intersection in cap plane
