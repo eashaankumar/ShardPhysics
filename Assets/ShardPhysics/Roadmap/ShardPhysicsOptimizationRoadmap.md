@@ -6,24 +6,30 @@ The engine now performs:
 
 1. **Body-level broadphase** using world-space AABBs to reject non-overlapping body pairs.
 2. Narrowphase collision detection only for candidate body pairs.
-3. TriangleMesh collisions use a **triangle AABB prefilter** before running primitive-vs-triangle narrowphase.
-4. **Collision detection runs once per simulation substep instead of once per solver iteration.**
-5. **Generated contact manifolds are cached and reused across every solver iteration.**
-6. **Broadphase and narrowphase are no longer repeatedly executed during iterative impulse solving.**
-7. Box↔Mesh collision now works through robust Box↔Triangle contacts.
-8. Box↔Mesh collision supports terrain-style surfaces, vertical-ish walls, corners, edges, and thin triangle cases better than before.
+3. TriangleMesh collisions use a **TriangleMesh BVH** to query only nearby triangles before narrowphase.
+4. Candidate triangles then pass through a **triangle AABB prefilter** before primitive-vs-triangle narrowphase.
+5. **Collision detection runs once per simulation substep instead of once per solver iteration.**
+6. **Generated contact manifolds are cached and reused across every solver iteration.**
+7. **Broadphase and narrowphase are no longer repeatedly executed during iterative impulse solving.**
+8. Box↔Mesh collision now works through robust Box↔Triangle contacts.
+9. Box↔Mesh collision supports terrain-style surfaces, vertical walls, corners, edges, and thin triangle cases.
+10. The entire collision pipeline remains **NativeMemory-based**, with no managed allocations during simulation.
 
-Example:
+Current collision pipeline:
 
 ```text
 Simulation Substep
 
-Broadphase
-      ↓
+Body Broadphase
+        ↓
+TriangleMesh BVH Query
+        ↓
+Triangle AABB Prefilter
+        ↓
 Generate Contact Manifolds
-      ↓
+        ↓
 Cache Contacts
-      ↓
+        ↓
 Solver Iteration 1
 Solver Iteration 2
 Solver Iteration 3
@@ -32,7 +38,7 @@ Solver Iteration 5
 Solver Iteration 6
 ```
 
-Collision detection is now separated from constraint solving. Contacts are generated once, cached, and reused throughout the solver iterations. This eliminates redundant broadphase and narrowphase work while producing the same collision behavior at much higher FPS.
+Collision detection is now separated from constraint solving. Contacts are generated once, cached, and reused throughout the solver iterations. Triangle meshes are spatially accelerated using a BVH before narrowphase, greatly reducing unnecessary triangle testing.
 
 ---
 
@@ -60,11 +66,9 @@ Body Broadphase:
 
 # Step 2 — TriangleMesh Narrowphase Prefilter
 
-This is **not** body broadphase.
+This occurs **after** body broadphase.
 
-It happens **after** body broadphase has determined that two bodies may collide.
-
-Instead of running narrowphase against every triangle:
+Primitive AABBs are compared against candidate triangle AABBs before narrowphase.
 
 ```text
 Primitive AABB
@@ -72,53 +76,28 @@ Primitive AABB
 Triangle AABB
 ```
 
-Only nearby triangles are sent to the narrowphase.
+Only nearby triangles proceed into primitive-vs-triangle collision.
 
-Example:
-
-```text
-Terrain
-1000 triangles
-
-Previous:
-Sphere / Box / Capsule -> 1000 triangle narrowphase tests
-
-With triangle prefilter:
-Sphere / Box / Capsule -> ~8 triangle narrowphase tests
-```
-
-~~TriangleMesh triangle-AABB prefilter is now implemented for Sphere, Box, and Capsule mesh collisions.~~
+~~TriangleMesh triangle-AABB prefilter is implemented for Sphere, Box, and Capsule mesh collisions.~~
 
 ---
 
 # Step 3 — Cached Contact Generation
 
-Previously the physics engine rebuilt collision information during every solver iteration.
+Previously every solver iteration rebuilt collision information.
 
 Previous architecture:
 
 ```text
-Iteration 1
-  Broadphase
-  Generate Contacts
-  Solve
-
-Iteration 2
-  Broadphase
-  Generate Contacts
-  Solve
-
-Iteration 3
-  Broadphase
-  Generate Contacts
-  Solve
-
-...
+Iteration
+    Broadphase
+    Generate Contacts
+    Solve
 ```
 
-With six solver iterations, broadphase and narrowphase were executed six times every simulation substep.
+Repeated six times every substep.
 
-The engine now performs:
+Current architecture:
 
 ```text
 Simulation Substep
@@ -129,89 +108,106 @@ Generate Contact Manifolds
       ↓
 Cache Contacts
       ↓
-Solver Iteration 1
-Solver Iteration 2
-Solver Iteration 3
-Solver Iteration 4
-Solver Iteration 5
-Solver Iteration 6
+Solver Iterations
 ```
 
 Completed:
 
 * ~~Broadphase rebuilt once per simulation substep~~
 * ~~Collision detection executed once per simulation substep~~
-* ~~Contact manifolds cached~~
+* ~~Cached contact manifolds~~
 * ~~Solver iterations reuse cached contacts~~
-* ~~Removed redundant broadphase work~~
-* ~~Removed redundant narrowphase work~~
+* ~~Removed repeated broadphase~~
+* ~~Removed repeated narrowphase~~
 
 Benefits:
 
-* Dramatically reduced CPU usage
-* Significantly higher frame rates
-* Solver architecture now scales much better as iteration count increases
-* Future optimizations become more effective because collision detection is no longer repeated unnecessarily
+* Dramatically lower CPU usage
+* Significantly higher FPS
+* Solver cost scales much better with iteration count
 
 ---
 
 # Step 4 — Box ↔ Mesh Collision Robustness
 
-Box↔Mesh collision works by reducing mesh collision into Box↔Triangle tests.
-
 Current support:
 
 * ~~Box↔Triangle SAT overlap testing~~
-* ~~Box vertices crossing triangle plane / terrain-style face contact~~
-* ~~Box↔Mesh collision through triangle iteration~~
-* ~~Box↔Mesh support for heightfield terrain~~
-* ~~Triangle vertices inside box contact generation~~
+* ~~Box vertices crossing triangle plane~~
+* ~~Box↔Mesh terrain collision~~
+* ~~Triangle vertices inside box~~
 * ~~Edge-edge closest-point contacts~~
 * ~~Improved Box↔Triangle manifold generation~~
-* ~~Better support for vertical walls~~
-* ~~Better support for sharp mesh corners~~
-* ~~Better support for thin triangle cases~~
+* ~~Better vertical wall support~~
+* ~~Better sharp corner support~~
+* ~~Better thin triangle support~~
 
-Remaining robustness work:
+Remaining work:
 
 * Multi-contact manifold clipping
-* More stress testing on arbitrary non-heightfield meshes
-* More extreme thin-geometry testing
-* Contact reduction / contact prioritization for dense triangle overlaps
+* Contact reduction / prioritization
+* Additional stress testing on arbitrary meshes
 
 ---
 
-# Step 5 — Future Mesh Acceleration
+# Step 5 — TriangleMesh BVH
 
-Triangle AABB prefilter still scans every triangle in an overlapping mesh.
-
-That means this is improved:
+Previously every overlapping mesh required scanning every triangle:
 
 ```text
-1000 triangles
-→ 1000 cheap AABB tests
-→ ~8 narrowphase tests
+Mesh
+ ↓
+
+Triangle 0
+Triangle 1
+Triangle 2
+...
+Triangle 999
 ```
 
-But a future BVH would improve it further:
+Current implementation:
 
 ```text
-1000 triangles
-→ Traverse Mesh BVH
-→ Visit nearby nodes
-→ Test nearby triangle AABBs
-→ Run narrowphase on final candidates
+Mesh
+ ↓
+TriangleMesh BVH
+ ↓
+Nearby BVH Nodes
+ ↓
+Candidate Triangles
+ ↓
+Triangle AABB Prefilter
+ ↓
+Primitive-vs-Triangle Narrowphase
 ```
 
-Future mesh acceleration work:
+Completed:
 
-* Mesh BVH construction
-* Mesh BVH traversal
-* Terrain chunk BVH support
-* Optional spatial hash grid for terrain-like meshes
-* Avoid scanning every triangle in large meshes
+* ~~NativeMemory BVH node storage~~
+* ~~Native triangle index storage~~
+* ~~Median split BVH builder~~
+* ~~Iterative BVH traversal~~
+* ~~BVH integration for Sphere↔Mesh~~
+* ~~BVH integration for Box↔Mesh~~
+* ~~BVH integration for Capsule↔Mesh~~
+* ~~No managed allocations during BVH traversal~~
+* ~~No GC during simulation~~
 
-This is now the next major optimization target.
+Benefits:
+
+* Avoids scanning every triangle in large meshes
+* Scales significantly better with terrain size
+* NativeMemory-only implementation
+* Reusable for future raycasts and spatial queries
+
+Remaining improvements:
+
+* Surface Area Heuristic (SAH) builder
+* Parallel BVH construction
+* BVH refit for deformable meshes
+* Debug BVH visualization
+* Benchmark counters
+* Profiling and tuning of leaf size
 
 ---
 
@@ -222,10 +218,11 @@ After the engine is stable:
 * Spatial hash grid
 * Sweep and Prune (SAP)
 * Dynamic AABB Tree
-* Bounding Volume Hierarchy (BVH)
+* Pair cache
+* Incremental broadphase updates
 * Sharded multithreaded broadphase
 
-These will eventually replace the current simple body-AABB broadphase.
+These would replace the current simple body-AABB broadphase for large dynamic scenes.
 
 ---
 
@@ -235,11 +232,10 @@ These will eventually replace the current simple body-AABB broadphase.
 2. ~~Body AABB broadphase~~
 3. ~~TriangleMesh triangle-AABB prefilter~~
 4. ~~Cached contact generation~~
-5. ~~Box↔Mesh robustness improvements~~
-6. ➜ Mesh BVH
-7. ➜ Advanced body broadphase (Grid / SAP / Dynamic AABB Tree)
-
-This approach keeps the engine simple while providing significant performance gains at each stage.
+5. ~~Box↔Mesh robustness~~
+6. ~~TriangleMesh BVH~~
+7. ➜ BVH profiling & optimization
+8. ➜ Advanced body broadphase (Grid / SAP / Dynamic AABB Tree)
 
 ---
 
@@ -247,68 +243,84 @@ This approach keeps the engine simple while providing significant performance ga
 
 ## Completed
 
+### Broadphase
+
 * ~~Brute-force body pair testing~~
 * ~~Body AABB generation~~
 * ~~Body AABB overlap testing~~
 * ~~Candidate body pair generation~~
 * ~~Skip static-static body pairs~~
-* ~~Basic `Broadphase.cs` implementation~~
-* ~~Broadphase integration into collision pair generation~~
-* ~~Primitive localPose support for Sphere / Box / Capsule~~
+* ~~Broadphase integration~~
+
+### TriangleMesh
+
 * ~~Triangle AABB prefilter~~
 * ~~Triangle candidate generation~~
-* ~~Skip distant triangles before narrowphase~~
-* ~~Basic Box↔Triangle SAT overlap~~
-* ~~Box-vertex-to-triangle-plane contact path~~
-* ~~Basic Box↔Mesh terrain collision~~
+* ~~Skip distant triangles~~
+* ~~TriangleMesh BVH implementation~~
+* ~~Native BVH node storage~~
+* ~~Median split BVH builder~~
+* ~~Iterative BVH traversal~~
+* ~~Sphere↔Mesh BVH queries~~
+* ~~Box↔Mesh BVH queries~~
+* ~~Capsule↔Mesh BVH queries~~
+* ~~No GC BVH traversal~~
+
+### Solver
+
 * ~~Broadphase rebuilt once per simulation substep~~
 * ~~Collision detection executed once per simulation substep~~
 * ~~Cached contact manifold generation~~
 * ~~Reuse cached contacts across all solver iterations~~
-* ~~Removed repeated broadphase from iterative solver~~
-* ~~Removed repeated narrowphase from iterative solver~~
-* ~~Triangle vertices inside box contacts~~
+* ~~Removed repeated broadphase~~
+* ~~Removed repeated narrowphase~~
+
+### Box ↔ Mesh
+
+* ~~Basic Box↔Triangle SAT~~
+* ~~Box-vertex-to-triangle-plane contacts~~
+* ~~Triangle vertices inside box~~
 * ~~Edge-edge closest-point contacts~~
 * ~~Improved Box↔Triangle manifold generation~~
-* ~~Improved Box↔Mesh cube collision behavior~~
-* ~~Improved Box↔Mesh terrain collision behavior~~
-* ~~Improved support for walls, corners, and thin triangles~~
+* ~~Improved Box↔Mesh collision behavior~~
+* ~~Improved terrain collision~~
+* ~~Improved wall, corner, and thin triangle support~~
+
+---
 
 ## Remaining
 
-### Box ↔ Mesh Robustness
+### Box ↔ Mesh
 
 * Multi-contact manifold clipping
-* Contact reduction / contact prioritization
-* More arbitrary mesh stress testing
-* More vertical wall testing
-* More mesh edge/corner testing
-* More thin triangle testing
+* Contact reduction / prioritization
+* Additional arbitrary mesh stress testing
 
-### Mesh Optimization
+### TriangleMesh BVH
 
-* Mesh BVH construction
-* Mesh BVH traversal
-* Avoid scanning every triangle in large meshes
-* Terrain chunk acceleration
-* Profile terrain performance improvements
+* SAH BVH builder
+* BVH refit support
+* Parallel BVH construction
+* Debug visualization
+* Benchmark counters
+* Tune leaf size
+* Performance profiling
 
 ### Advanced Broadphase
 
 * Spatial hash grid
 * Sweep and Prune (SAP)
 * Dynamic AABB Tree
-* BVH
 * Pair cache
-* Incremental broadphase updates
+* Incremental updates
 * Multithreaded broadphase
 
 ### Performance
 
 * Benchmark broadphase scalability
-* Benchmark TriangleMesh optimization
-* Benchmark cached contact generation
-* Compare against previous brute-force implementation
-* Compare cached-contact solver against previous iterative collision detection
-* Benchmark Box↔Mesh collision cost
-* Benchmark Mesh BVH once implemented
+* Benchmark BVH effectiveness
+* Count BVH nodes visited
+* Count candidate triangles returned
+* Count narrowphase triangle tests
+* Compare BVH against previous full triangle scan
+* Profile large terrain performance
