@@ -361,6 +361,90 @@ namespace Shard.Runtime.Solvers
             SetSingleContact(ref manifold, bestTrianglePoint, normal, depth);
             return true;
         }
+        
+        public static bool SolveBoxTriangle(Box box, Triangle triangle, out ContactPointManifold manifold)
+        {
+            manifold = default;
+
+            // Work in box-local space: box is centered at origin, axes are world-aligned,
+            // triangle is transformed into that space.
+            Triangle localTriangle = new Triangle(
+                WorldToBoxLocal(triangle.a, box),
+                WorldToBoxLocal(triangle.b, box),
+                WorldToBoxLocal(triangle.c, box));
+
+            float3 triEdge0 = localTriangle.b - localTriangle.a;
+            float3 triEdge1 = localTriangle.c - localTriangle.b;
+            float3 triEdge2 = localTriangle.a - localTriangle.c;
+
+            float3 triNormalLocal = math.cross(triEdge0, localTriangle.c - localTriangle.a);
+
+            float bestOverlap = float.PositiveInfinity;
+            float3 bestAxisLocal = new float3(0f, 1f, 0f);
+
+            // Box face axes.
+            if (!TestBoxTriangleAxis(new float3(1f, 0f, 0f), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+
+            if (!TestBoxTriangleAxis(new float3(0f, 1f, 0f), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+
+            if (!TestBoxTriangleAxis(new float3(0f, 0f, 1f), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+
+            // Triangle face axis.
+            if (!TestBoxTriangleAxis(triNormalLocal, box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+
+            // Cross axes: box axes x triangle edges.
+            float3 boxAxisX = new float3(1f, 0f, 0f);
+            float3 boxAxisY = new float3(0f, 1f, 0f);
+            float3 boxAxisZ = new float3(0f, 0f, 1f);
+
+            if (!TestBoxTriangleAxis(math.cross(boxAxisX, triEdge0), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+            if (!TestBoxTriangleAxis(math.cross(boxAxisX, triEdge1), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+            if (!TestBoxTriangleAxis(math.cross(boxAxisX, triEdge2), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+
+            if (!TestBoxTriangleAxis(math.cross(boxAxisY, triEdge0), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+            if (!TestBoxTriangleAxis(math.cross(boxAxisY, triEdge1), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+            if (!TestBoxTriangleAxis(math.cross(boxAxisY, triEdge2), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+
+            if (!TestBoxTriangleAxis(math.cross(boxAxisZ, triEdge0), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+            if (!TestBoxTriangleAxis(math.cross(boxAxisZ, triEdge1), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+            if (!TestBoxTriangleAxis(math.cross(boxAxisZ, triEdge2), box.halfExtents, localTriangle, ref bestOverlap, ref bestAxisLocal))
+                return false;
+
+            float3 triCentroidLocal = (localTriangle.a + localTriangle.b + localTriangle.c) / 3f;
+
+            // Normal must point from A -> B.
+            // A is box, B is triangle.
+            if (math.dot(bestAxisLocal, triCentroidLocal) < 0f)
+                bestAxisLocal = -bestAxisLocal;
+
+            float3 normalWorld = math.normalize(math.mul(box.rotation, bestAxisLocal));
+
+            float3 pointWorld = FindBoxTriangleContactPoint(box, triangle);
+
+            SetSingleContact(ref manifold, pointWorld, normalWorld, bestOverlap);
+            return true;
+        }
+
+        public static bool SolveTriangleBox(Triangle triangle, Box box, out ContactPointManifold manifold)
+        {
+            if (!SolveBoxTriangle(box, triangle, out manifold))
+                return false;
+
+            FlipManifold(ref manifold);
+            return true;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void FlipManifold(ref ContactPointManifold manifold)
@@ -593,6 +677,113 @@ namespace Shard.Runtime.Solvers
                 bestCapsulePoint = p;
                 bestTrianglePoint = q;
             }
+        }
+        
+        private static bool TestBoxTriangleAxis(
+            float3 axis,
+            float3 boxHalfExtents,
+            Triangle localTriangle,
+            ref float bestOverlap,
+            ref float3 bestAxis)
+        {
+            float axisLenSq = math.lengthsq(axis);
+
+            if (axisLenSq < EPSILON)
+                return true;
+
+            axis *= math.rsqrt(axisLenSq);
+
+            ProjectBoxOnAxis(boxHalfExtents, axis, out float boxMin, out float boxMax);
+            ProjectTriangleOnAxis(localTriangle, axis, out float triMin, out float triMax);
+
+            float overlap = math.min(boxMax, triMax) - math.max(boxMin, triMin);
+
+            if (overlap < 0f)
+                return false;
+
+            if (overlap < bestOverlap)
+            {
+                bestOverlap = overlap;
+                bestAxis = axis;
+            }
+
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void ProjectBoxOnAxis(float3 halfExtents, float3 axis, out float min, out float max)
+        {
+            float r =
+                halfExtents.x * math.abs(axis.x) +
+                halfExtents.y * math.abs(axis.y) +
+                halfExtents.z * math.abs(axis.z);
+
+            min = -r;
+            max = r;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void ProjectTriangleOnAxis(Triangle triangle, float3 axis, out float min, out float max)
+        {
+            float p0 = math.dot(triangle.a, axis);
+            float p1 = math.dot(triangle.b, axis);
+            float p2 = math.dot(triangle.c, axis);
+
+            min = math.min(p0, math.min(p1, p2));
+            max = math.max(p0, math.max(p1, p2));
+        }
+
+        private static float3 FindBoxTriangleContactPoint(Box box, Triangle triangle)
+        {
+            float bestDistSq = float.PositiveInfinity;
+            float3 bestPoint = triangle.a;
+
+            // Triangle vertices against box.
+            CheckTriangleVertexBoxPoint(triangle.a, box, ref bestPoint, ref bestDistSq);
+            CheckTriangleVertexBoxPoint(triangle.b, box, ref bestPoint, ref bestDistSq);
+            CheckTriangleVertexBoxPoint(triangle.c, box, ref bestPoint, ref bestDistSq);
+
+            // Box vertices against triangle.
+            for (int i = 0; i < 8; i++)
+            {
+                float3 boxVertex = GetBoxVertexWorld(box, i);
+                float3 triPoint = ClosestPointOnTriangle(boxVertex, triangle.a, triangle.b, triangle.c);
+                float dSq = math.lengthsq(triPoint - boxVertex);
+
+                if (dSq < bestDistSq)
+                {
+                    bestDistSq = dSq;
+                    bestPoint = (boxVertex + triPoint) * 0.5f;
+                }
+            }
+
+            return bestPoint;
+        }
+
+        private static void CheckTriangleVertexBoxPoint(
+            float3 triangleVertex,
+            Box box,
+            ref float3 bestPoint,
+            ref float bestDistSq)
+        {
+            float3 boxPoint = ClosestPointOnBox(triangleVertex, box);
+            float dSq = math.lengthsq(boxPoint - triangleVertex);
+
+            if (dSq < bestDistSq)
+            {
+                bestDistSq = dSq;
+                bestPoint = (triangleVertex + boxPoint) * 0.5f;
+            }
+        }
+
+        private static float3 GetBoxVertexWorld(Box box, int index)
+        {
+            float3 local = new float3(
+                (index & 1) == 0 ? -box.halfExtents.x : box.halfExtents.x,
+                (index & 2) == 0 ? -box.halfExtents.y : box.halfExtents.y,
+                (index & 4) == 0 ? -box.halfExtents.z : box.halfExtents.z);
+
+            return BoxLocalToWorld(local, box);
         }
     }
 }

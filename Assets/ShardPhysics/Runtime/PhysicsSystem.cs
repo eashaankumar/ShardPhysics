@@ -873,7 +873,29 @@ namespace Shard.Runtime
                 SimpleShapeSolvers.FlipManifold(ref cps);
                 return true;
             }
-            
+
+            // ---------- Box - Triangle ----------
+            if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
+                TryGetBodyTriangle(b, pb, out triangleB, out matTriangleB))
+            {
+                CombineMaterials(matBoxA, matTriangleB, out restitution, out muS, out muD, out muR);
+
+                var box = new SimpleShapeSolvers.Box(pa.position, pa.rotation, boxAHalf);
+
+                return SimpleShapeSolvers.SolveBoxTriangle(box, triangleB, out cps);
+            }
+
+            // ---------- Triangle - Box ----------
+            if (TryGetBodyTriangle(a, pa, out triangleA, out matTriangleA) &&
+                TryGetBodyBox(b, out boxBHalf, out matBoxB))
+            {
+                CombineMaterials(matTriangleA, matBoxB, out restitution, out muS, out muD, out muR);
+
+                var box = new SimpleShapeSolvers.Box(pb.position, pb.rotation, boxBHalf);
+
+                return SimpleShapeSolvers.SolveTriangleBox(triangleA, box, out cps);
+            }
+
             // ---------- Sphere - TriangleMesh ----------
             if (TryGetBodySphere(a, out sphereARadius, out matSphereA) &&
                 TryGetBodyTriangleMesh(
@@ -916,9 +938,7 @@ namespace Shard.Runtime
                         meshInfoA,
                         meshPoseA,
                         out cps))
-                {
                     return false;
-                }
 
                 SimpleShapeSolvers.FlipManifold(ref cps);
                 return true;
@@ -926,21 +946,11 @@ namespace Shard.Runtime
 
             // ---------- Capsule - TriangleMesh ----------
             if (TryGetBodyCapsule(a, out capsuleAHalfHeight, out capsuleARadius, out matCapsuleA) &&
-                TryGetBodyTriangleMesh(
-                    b,
-                    pb,
-                    out meshColliderB,
-                    out meshPoseB,
-                    out meshInfoB,
-                    out matMeshB))
+                TryGetBodyTriangleMesh(b, pb, out meshColliderB, out meshPoseB, out meshInfoB, out matMeshB))
             {
                 CombineMaterials(matCapsuleA, matMeshB, out restitution, out muS, out muD, out muR);
 
-                var capsule = new SimpleShapeSolvers.Capsule(
-                    pa.position,
-                    pa.rotation,
-                    capsuleAHalfHeight,
-                    capsuleARadius);
+                var capsule = new SimpleShapeSolvers.Capsule(pa.position, pa.rotation, capsuleAHalfHeight, capsuleARadius);
 
                 return SolveCapsuleTriangleMesh(
                     capsule,
@@ -951,22 +961,12 @@ namespace Shard.Runtime
             }
 
             // ---------- TriangleMesh - Capsule ----------
-            if (TryGetBodyTriangleMesh(
-                    a,
-                    pa,
-                    out meshColliderA,
-                    out meshPoseA,
-                    out meshInfoA,
-                    out matMeshA) &&
+            if (TryGetBodyTriangleMesh(a, pa, out meshColliderA, out meshPoseA, out meshInfoA, out matMeshA) &&
                 TryGetBodyCapsule(b, out capsuleBHalfHeight, out capsuleBRadius, out matCapsuleB))
             {
                 CombineMaterials(matMeshA, matCapsuleB, out restitution, out muS, out muD, out muR);
 
-                var capsule = new SimpleShapeSolvers.Capsule(
-                    pb.position,
-                    pb.rotation,
-                    capsuleBHalfHeight,
-                    capsuleBRadius);
+                var capsule = new SimpleShapeSolvers.Capsule(pb.position, pb.rotation, capsuleBHalfHeight, capsuleBRadius);
 
                 if (!SolveCapsuleTriangleMesh(
                         capsule,
@@ -974,9 +974,43 @@ namespace Shard.Runtime
                         meshInfoA,
                         meshPoseA,
                         out cps))
-                {
                     return false;
-                }
+
+                SimpleShapeSolvers.FlipManifold(ref cps);
+                return true;
+            }
+            
+            // ---------- Box - TriangleMesh ----------
+            if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
+                TryGetBodyTriangleMesh(b, pb, out meshColliderB, out meshPoseB, out meshInfoB, out matMeshB))
+            {
+                CombineMaterials(matBoxA, matMeshB, out restitution, out muS, out muD, out muR);
+
+                var box = new SimpleShapeSolvers.Box(pa.position, pa.rotation, boxAHalf);
+
+                return SolveBoxTriangleMesh(
+                    box,
+                    meshColliderB.meshIndex,
+                    meshInfoB,
+                    meshPoseB,
+                    out cps);
+            }
+
+            // ---------- TriangleMesh - Box ----------
+            if (TryGetBodyTriangleMesh(a, pa, out meshColliderA, out meshPoseA, out meshInfoA, out matMeshA) &&
+                TryGetBodyBox(b, out boxBHalf, out matBoxB))
+            {
+                CombineMaterials(matMeshA, matBoxB, out restitution, out muS, out muD, out muR);
+
+                var box = new SimpleShapeSolvers.Box(pb.position, pb.rotation, boxBHalf);
+
+                if (!SolveBoxTriangleMesh(
+                        box,
+                        meshColliderA.meshIndex,
+                        meshInfoA,
+                        meshPoseA,
+                        out cps))
+                    return false;
 
                 SimpleShapeSolvers.FlipManifold(ref cps);
                 return true;
@@ -1456,6 +1490,43 @@ namespace Shard.Runtime
                 {
                     continue;
                 }
+
+                if (!hit || candidate.globalPenDepth > bestDepth)
+                {
+                    hit = true;
+                    bestDepth = candidate.globalPenDepth;
+                    bestManifold = candidate;
+                }
+            }
+
+            return hit;
+        }
+        
+        private bool SolveBoxTriangleMesh(
+            SimpleShapeSolvers.Box box,
+            int meshIndex,
+            ShardTriangleMeshInfo meshInfo,
+            Pose meshWorldPose,
+            out ContactPointManifold bestManifold)
+        {
+            bestManifold = default;
+
+            bool hit = false;
+            float bestDepth = float.NegativeInfinity;
+
+            for (int i = 0; i < meshInfo.triangleCount; i++)
+            {
+                if (!triangleMeshStore.TryGetTriangle(meshIndex, i, out ShardTriangle localTriangle))
+                    continue;
+
+                SimpleShapeSolvers.Triangle worldTriangle =
+                    TransformTriangle(localTriangle, meshWorldPose);
+
+                if (!SimpleShapeSolvers.SolveBoxTriangle(
+                        box,
+                        worldTriangle,
+                        out ContactPointManifold candidate))
+                    continue;
 
                 if (!hit || candidate.globalPenDepth > bestDepth)
                 {
