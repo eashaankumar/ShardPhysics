@@ -53,7 +53,7 @@ namespace Shard.Runtime
             this.c = c;
         }
     }
-
+    
     public struct Aabb
     {
         public float3 min;
@@ -360,8 +360,20 @@ namespace Shard.Runtime
             NativeList<int> results,
             NativeList<int> stack)
         {
+            ShardTriangleMeshQueryStats stats = default;
+            return QueryTriangles(meshIndex, queryLocalAabb, results, stack, ref stats);
+        }
+
+        public bool QueryTriangles(
+            int meshIndex,
+            Aabb queryLocalAabb,
+            NativeList<int> results,
+            NativeList<int> stack,
+            ref ShardTriangleMeshQueryStats stats)
+        {
             results.Clear();
             stack.Clear();
+            stats.Reset();
 
             if (!TryGetMeshInfo(meshIndex, out ShardTriangleMeshInfo mesh))
                 return false;
@@ -380,6 +392,8 @@ namespace Shard.Runtime
                 if ((uint)nodeIndex >= (uint)_bvhNodes.Length)
                     continue;
 
+                stats.nodesVisited++;
+
                 ShardTriangleMeshBvhNode node = _bvhNodes[nodeIndex];
 
                 if (!queryLocalAabb.Overlaps(node.bounds))
@@ -387,11 +401,16 @@ namespace Shard.Runtime
 
                 if (node.triangleCount > 0)
                 {
+                    stats.leafNodesVisited++;
+
                     int start = node.firstTriangle;
                     int end = start + node.triangleCount;
 
                     for (int i = start; i < end; i++)
+                    {
                         results.Add(_bvhTriangleIndices[i]);
+                        stats.triangleCandidatesReturned++;
+                    }
 
                     continue;
                 }
@@ -412,7 +431,18 @@ namespace Shard.Runtime
             NativeList<int> results,
             NativeList<int> stack)
         {
-            return QueryTriangles(handle.value, queryLocalAabb, results, stack);
+            ShardTriangleMeshQueryStats stats = default;
+            return QueryTriangles(handle.value, queryLocalAabb, results, stack, ref stats);
+        }
+
+        public bool QueryTriangles(
+            ShardTriangleMeshHandle handle,
+            Aabb queryLocalAabb,
+            NativeList<int> results,
+            NativeList<int> stack,
+            ref ShardTriangleMeshQueryStats stats)
+        {
+            return QueryTriangles(handle.value, queryLocalAabb, results, stack, ref stats);
         }
 
         private void BuildBvhForMesh(int meshIndex)

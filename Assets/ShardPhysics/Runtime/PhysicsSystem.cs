@@ -21,6 +21,9 @@ namespace Shard.Runtime
         ShardTriangleMeshStore triangleMeshStore;
         Broadphase broadphase;
         NativeList<CachedContact> cachedContacts;
+        NativeList<int> meshTriangleCandidates;
+        NativeList<int> meshBvhQueryStack;
+        ShardPhysicsPerformanceStats performanceStats;
 
         private struct CachedContact
         {
@@ -34,6 +37,8 @@ namespace Shard.Runtime
         }
 
         public float3 gravity;
+
+        public ShardPhysicsPerformanceStats LastPerformanceStats => performanceStats;
 
         public ShardPhysicsWorld()
         {
@@ -54,6 +59,8 @@ namespace Shard.Runtime
             slotMap = new DenseSlotMap(initialCapacity: 16, allocator: Allocator.Persistent);
             broadphase = new Broadphase(initialBodyCapacity: 16, allocator: Allocator.Persistent);
             cachedContacts = new NativeList<CachedContact>(initialCapacity: 64, allocator: Allocator.Persistent);
+            meshTriangleCandidates = new NativeList<int>(initialCapacity: 128, allocator: Allocator.Persistent);
+            meshBvhQueryStack = new NativeList<int>(initialCapacity: 64, allocator: Allocator.Persistent);
         }
 
         public void Dispose()
@@ -69,6 +76,8 @@ namespace Shard.Runtime
             triangleMeshStore.Dispose();
             broadphase.Dispose();
             if (cachedContacts.IsCreated) cachedContacts.Dispose();
+            if (meshTriangleCandidates.IsCreated) meshTriangleCandidates.Dispose();
+            if (meshBvhQueryStack.IsCreated) meshBvhQueryStack.Dispose();
         }
 
         #region --------- Create Body ----------
@@ -633,6 +642,10 @@ namespace Shard.Runtime
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Simulate(float dt, int substeps=4, int collisionIterations = 6)
         {
+            performanceStats.Reset();
+            performanceStats.substeps = substeps;
+            performanceStats.collisionIterations = collisionIterations;
+
             EnforceTypeInvariants();
 
             float h = dt / substeps;
@@ -1037,6 +1050,7 @@ namespace Shard.Runtime
 
             // Broadphase is now rebuilt once per substep, not once per solver iteration.
             broadphase.Rebuild(poses, bodyTypes, colliderStore, triangleMeshStore);
+            performanceStats.bodyPairsFromBroadphase += broadphase.PairCount;
 
             for (int pairIndex = 0; pairIndex < broadphase.PairCount; pairIndex++)
             {
@@ -1094,6 +1108,9 @@ namespace Shard.Runtime
 
                 if (cps.numContactPoints <= 0)
                     continue;
+
+                performanceStats.contactManifoldsGenerated++;
+                performanceStats.contactPointsGenerated += cps.numContactPoints;
 
                 cachedContacts.Add(new CachedContact
                 {
@@ -1589,6 +1606,71 @@ namespace Shard.Runtime
             return aabb;
         }
 
+        private static Aabb TransformAabbWorldToLocal(Aabb worldAabb, Pose localToWorld)
+        {
+            quaternion inverseRotation = math.inverse(localToWorld.rotation);
+            Aabb localAabb = Aabb.Empty;
+
+            float3 min = worldAabb.min;
+            float3 max = worldAabb.max;
+
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(min.x, min.y, min.z), localToWorld.position, inverseRotation);
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(max.x, min.y, min.z), localToWorld.position, inverseRotation);
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(min.x, max.y, min.z), localToWorld.position, inverseRotation);
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(max.x, max.y, min.z), localToWorld.position, inverseRotation);
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(min.x, min.y, max.z), localToWorld.position, inverseRotation);
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(max.x, min.y, max.z), localToWorld.position, inverseRotation);
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(min.x, max.y, max.z), localToWorld.position, inverseRotation);
+            EncapsulateWorldAabbCorner(ref localAabb, new float3(max.x, max.y, max.z), localToWorld.position, inverseRotation);
+
+            return localAabb;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void EncapsulateWorldAabbCorner(
+            ref Aabb localAabb,
+            float3 worldPoint,
+            float3 worldPosition,
+            quaternion inverseRotation)
+        {
+            localAabb.Encapsulate(math.mul(inverseRotation, worldPoint - worldPosition));
+        }
+
+        private bool QueryMeshTrianglesOrFallback(
+            int meshIndex,
+            ShardTriangleMeshInfo meshInfo,
+            Aabb queryWorldAabb,
+            Pose meshWorldPose)
+        {
+            Aabb queryLocalAabb = TransformAabbWorldToLocal(queryWorldAabb, meshWorldPose);
+
+            ShardTriangleMeshQueryStats queryStats = default;
+
+            if (triangleMeshStore.QueryTriangles(
+                    meshIndex,
+                    queryLocalAabb,
+                    meshTriangleCandidates,
+                    meshBvhQueryStack,
+                    ref queryStats))
+            {
+                performanceStats.meshBvhQueries++;
+                performanceStats.meshBvhNodesVisited += queryStats.nodesVisited;
+                performanceStats.meshBvhLeafNodesVisited += queryStats.leafNodesVisited;
+                performanceStats.meshBvhCandidateTrianglesReturned += queryStats.triangleCandidatesReturned;
+                return true;
+            }
+
+            meshTriangleCandidates.Clear();
+
+            for (int i = 0; i < meshInfo.triangleCount; i++)
+                meshTriangleCandidates.Add(i);
+
+            performanceStats.meshFullScanFallbacks++;
+            performanceStats.meshBvhCandidateTrianglesReturned += meshInfo.triangleCount;
+
+            return false;
+        }
+
         private bool SolveSphereTriangleMesh(
             SimpleShapeSolvers.Sphere sphere,
             int meshIndex,
@@ -1604,16 +1686,24 @@ namespace Shard.Runtime
             float deepest = float.NegativeInfinity;
             float3 accumulatedNormal = float3.zero;
 
-            for (int i = 0; i < meshInfo.triangleCount; i++)
+            QueryMeshTrianglesOrFallback(meshIndex, meshInfo, queryAabb, meshWorldPose);
+
+            for (int i = 0; i < meshTriangleCandidates.Length; i++)
             {
-                if (!triangleMeshStore.TryGetTriangle(meshIndex, i, out ShardTriangle localTriangle))
+                int triangleIndex = meshTriangleCandidates[i];
+
+                if (!triangleMeshStore.TryGetTriangle(meshIndex, triangleIndex, out ShardTriangle localTriangle))
                     continue;
 
                 SimpleShapeSolvers.Triangle worldTriangle =
                     TransformTriangle(localTriangle, meshWorldPose);
 
+                performanceStats.meshTriangleAabbTests++;
+
                 if (!queryAabb.Overlaps(ComputeTriangleAabb(worldTriangle)))
                     continue;
+
+                performanceStats.meshTriangleNarrowphaseTests++;
 
                 if (!SimpleShapeSolvers.SolveSphereTriangle(
                         sphere,
@@ -1718,16 +1808,24 @@ namespace Shard.Runtime
             float deepest = float.NegativeInfinity;
             float3 accumulatedNormal = float3.zero;
 
-            for (int i = 0; i < meshInfo.triangleCount; i++)
+            QueryMeshTrianglesOrFallback(meshIndex, meshInfo, queryAabb, meshWorldPose);
+
+            for (int i = 0; i < meshTriangleCandidates.Length; i++)
             {
-                if (!triangleMeshStore.TryGetTriangle(meshIndex, i, out ShardTriangle localTriangle))
+                int triangleIndex = meshTriangleCandidates[i];
+
+                if (!triangleMeshStore.TryGetTriangle(meshIndex, triangleIndex, out ShardTriangle localTriangle))
                     continue;
 
                 SimpleShapeSolvers.Triangle worldTriangle =
                     TransformTriangle(localTriangle, meshWorldPose);
 
+                performanceStats.meshTriangleAabbTests++;
+
                 if (!queryAabb.Overlaps(ComputeTriangleAabb(worldTriangle)))
                     continue;
+
+                performanceStats.meshTriangleNarrowphaseTests++;
 
                 if (!SimpleShapeSolvers.SolveBoxTriangle(
                         box,
@@ -1768,16 +1866,24 @@ namespace Shard.Runtime
             float deepest = float.NegativeInfinity;
             float3 accumulatedNormal = float3.zero;
 
-            for (int i = 0; i < meshInfo.triangleCount; i++)
+            QueryMeshTrianglesOrFallback(meshIndex, meshInfo, queryAabb, meshWorldPose);
+
+            for (int i = 0; i < meshTriangleCandidates.Length; i++)
             {
-                if (!triangleMeshStore.TryGetTriangle(meshIndex, i, out ShardTriangle localTriangle))
+                int triangleIndex = meshTriangleCandidates[i];
+
+                if (!triangleMeshStore.TryGetTriangle(meshIndex, triangleIndex, out ShardTriangle localTriangle))
                     continue;
 
                 SimpleShapeSolvers.Triangle worldTriangle =
                     TransformTriangle(localTriangle, meshWorldPose);
 
+                performanceStats.meshTriangleAabbTests++;
+
                 if (!queryAabb.Overlaps(ComputeTriangleAabb(worldTriangle)))
                     continue;
+
+                performanceStats.meshTriangleNarrowphaseTests++;
 
                 if (!SimpleShapeSolvers.SolveCapsuleTriangle(
                         capsule,
