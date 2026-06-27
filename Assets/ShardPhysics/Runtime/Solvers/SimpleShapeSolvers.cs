@@ -436,9 +436,9 @@ namespace Shard.Runtime.Solvers
                 bestAxisLocal = -bestAxisLocal;
 
             float3 normalWorld = math.normalize(math.mul(box.rotation, bestAxisLocal));
-            float3 pointWorld = FindBoxTriangleContactPoint(box, triangle);
+            float depth = math.max(bestOverlap, 0.001f);
 
-            SetSingleContact(ref manifold, pointWorld, normalWorld, math.max(bestOverlap, 0.001f));
+            BuildBoxTriangleContactManifold(box, triangle, normalWorld, depth, out manifold);
             return true;
         }
 
@@ -522,6 +522,183 @@ namespace Shard.Runtime.Solvers
 
             manifold.numContactPoints = index + 1;
         }
+        private static void BuildBoxTriangleContactManifold(
+            Box box,
+            Triangle triangle,
+            float3 normal,
+            float depth,
+            out ContactPointManifold manifold)
+        {
+            manifold = default;
+            manifold.globalPenAxis = normal;
+            manifold.globalPenDepth = depth;
+
+            // 1) Triangle vertices inside the box.
+            // This is important for wall/corner cases where the mesh penetrates the box,
+            // but no box vertex projects neatly onto the triangle face.
+            TryAddTriangleVertexInsideBoxContact(ref manifold, triangle.a, box, normal, depth);
+            TryAddTriangleVertexInsideBoxContact(ref manifold, triangle.b, box, normal, depth);
+            TryAddTriangleVertexInsideBoxContact(ref manifold, triangle.c, box, normal, depth);
+
+            // 2) Box vertices projected onto the triangle plane.
+            // This keeps the stable terrain-style contact behavior, but also works as
+            // part of the generic manifold instead of being the only success path.
+            const float projectionSlop = 0.05f;
+            for (int i = 0; i < 8; i++)
+            {
+                float3 vertex = GetBoxVertexWorld(box, i);
+                float signedDistance = math.dot(vertex - triangle.a, normal);
+
+                if (math.abs(signedDistance) > depth + projectionSlop)
+                    continue;
+
+                float3 projected = vertex - normal * signedDistance;
+
+                if (!PointInTriangle(projected, triangle.a, triangle.b, triangle.c))
+                    continue;
+
+                AddBoxTriangleContactUnique(ref manifold, projected, normal, depth);
+            }
+
+            // 3) Edge-edge closest contacts.
+            // This catches vertical walls, sharp edges, corners, and thin triangles where
+            // neither shape contributes a clean face contact.
+            AddBoxTriangleEdgeContacts(ref manifold, box, triangle, normal, depth);
+
+            // 4) Final fallback: one closest-feature contact.
+            // SAT already proved overlap, so never return an empty manifold here.
+            if (manifold.numContactPoints == 0)
+            {
+                float3 point = FindBoxTriangleContactPoint(box, triangle);
+                AddBoxTriangleContactUnique(ref manifold, point, normal, depth);
+            }
+
+            for (int i = 0; i < manifold.numContactPoints; i++)
+            {
+                ContactPoint cp = manifold[i];
+                cp.normal = normal;
+                cp.depth = depth;
+                manifold[i] = cp;
+            }
+        }
+
+        private static void TryAddTriangleVertexInsideBoxContact(
+            ref ContactPointManifold manifold,
+            float3 triangleVertex,
+            Box box,
+            float3 normal,
+            float depth)
+        {
+            float3 local = WorldToBoxLocal(triangleVertex, box);
+            const float insideSlop = 0.001f;
+
+            if (local.x < -box.halfExtents.x - insideSlop || local.x > box.halfExtents.x + insideSlop)
+                return;
+            if (local.y < -box.halfExtents.y - insideSlop || local.y > box.halfExtents.y + insideSlop)
+                return;
+            if (local.z < -box.halfExtents.z - insideSlop || local.z > box.halfExtents.z + insideSlop)
+                return;
+
+            AddBoxTriangleContactUnique(ref manifold, triangleVertex, normal, depth);
+        }
+
+        private static void AddBoxTriangleEdgeContacts(
+            ref ContactPointManifold manifold,
+            Box box,
+            Triangle triangle,
+            float3 normal,
+            float depth)
+        {
+            float maxDistance = math.max(depth + 0.03f, 0.04f);
+            float maxDistanceSq = maxDistance * maxDistance;
+
+            for (int boxEdge = 0; boxEdge < 12; boxEdge++)
+            {
+                GetBoxEdgeWorld(box, boxEdge, out float3 boxA, out float3 boxB);
+
+                TryAddEdgeEdgeContact(ref manifold, boxA, boxB, triangle.a, triangle.b, normal, depth, maxDistanceSq);
+                TryAddEdgeEdgeContact(ref manifold, boxA, boxB, triangle.b, triangle.c, normal, depth, maxDistanceSq);
+                TryAddEdgeEdgeContact(ref manifold, boxA, boxB, triangle.c, triangle.a, normal, depth, maxDistanceSq);
+
+                if (manifold.numContactPoints == 4)
+                    return;
+            }
+        }
+
+        private static void TryAddEdgeEdgeContact(
+            ref ContactPointManifold manifold,
+            float3 boxA,
+            float3 boxB,
+            float3 triA,
+            float3 triB,
+            float3 normal,
+            float depth,
+            float maxDistanceSq)
+        {
+            ClosestPointsSegmentSegment(boxA, boxB, triA, triB, out float3 p, out float3 q);
+            float distSq = math.lengthsq(q - p);
+
+            if (distSq > maxDistanceSq)
+                return;
+
+            float3 point = (p + q) * 0.5f;
+            AddBoxTriangleContactUnique(ref manifold, point, normal, depth);
+        }
+
+        private static void AddBoxTriangleContactUnique(
+            ref ContactPointManifold manifold,
+            float3 point,
+            float3 normal,
+            float depth)
+        {
+            const float duplicateDistanceSq = 0.0001f;
+
+            for (int i = 0; i < manifold.numContactPoints; i++)
+            {
+                ContactPoint existing = manifold[i];
+
+                if (math.lengthsq(existing.point - point) < duplicateDistanceSq)
+                {
+                    if (depth > existing.depth)
+                    {
+                        existing.point = point;
+                        existing.normal = normal;
+                        existing.depth = depth;
+                        manifold[i] = existing;
+                    }
+
+                    return;
+                }
+            }
+
+            if (manifold.numContactPoints < 4)
+            {
+                AddBoxTriangleContact(ref manifold, point, normal, depth);
+                return;
+            }
+
+            // Keep the contact set spread out by replacing the point nearest to the new one.
+            int nearestIndex = 0;
+            float nearestDistanceSq = math.lengthsq(manifold[0].point - point);
+
+            for (int i = 1; i < 4; i++)
+            {
+                float dSq = math.lengthsq(manifold[i].point - point);
+                if (dSq < nearestDistanceSq)
+                {
+                    nearestDistanceSq = dSq;
+                    nearestIndex = i;
+                }
+            }
+
+            manifold[nearestIndex] = new ContactPoint
+            {
+                point = point,
+                normal = normal,
+                depth = depth
+            };
+        }
+
 
         private static bool PointInTriangle(float3 p, float3 a, float3 b, float3 c)
         {
@@ -883,6 +1060,27 @@ namespace Shard.Runtime.Solvers
             {
                 bestDistSq = dSq;
                 bestPoint = (triangleVertex + boxPoint) * 0.5f;
+            }
+        }
+
+        private static void GetBoxEdgeWorld(Box box, int edgeIndex, out float3 a, out float3 b)
+        {
+            switch (edgeIndex)
+            {
+                case 0:  a = GetBoxVertexWorld(box, 0); b = GetBoxVertexWorld(box, 1); return;
+                case 1:  a = GetBoxVertexWorld(box, 2); b = GetBoxVertexWorld(box, 3); return;
+                case 2:  a = GetBoxVertexWorld(box, 4); b = GetBoxVertexWorld(box, 5); return;
+                case 3:  a = GetBoxVertexWorld(box, 6); b = GetBoxVertexWorld(box, 7); return;
+
+                case 4:  a = GetBoxVertexWorld(box, 0); b = GetBoxVertexWorld(box, 2); return;
+                case 5:  a = GetBoxVertexWorld(box, 1); b = GetBoxVertexWorld(box, 3); return;
+                case 6:  a = GetBoxVertexWorld(box, 4); b = GetBoxVertexWorld(box, 6); return;
+                case 7:  a = GetBoxVertexWorld(box, 5); b = GetBoxVertexWorld(box, 7); return;
+
+                case 8:  a = GetBoxVertexWorld(box, 0); b = GetBoxVertexWorld(box, 4); return;
+                case 9:  a = GetBoxVertexWorld(box, 1); b = GetBoxVertexWorld(box, 5); return;
+                case 10: a = GetBoxVertexWorld(box, 2); b = GetBoxVertexWorld(box, 6); return;
+                default: a = GetBoxVertexWorld(box, 3); b = GetBoxVertexWorld(box, 7); return;
             }
         }
 
