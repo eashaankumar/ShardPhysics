@@ -19,6 +19,7 @@ namespace Shard.Runtime
         DenseSlotMap slotMap;
         ShardColliderStore colliderStore;
         ShardTriangleMeshStore triangleMeshStore;
+        Broadphase broadphase;
 
         public float3 gravity;
 
@@ -39,6 +40,7 @@ namespace Shard.Runtime
                 allocator: Allocator.Persistent);
             
             slotMap = new DenseSlotMap(initialCapacity: 16, allocator: Allocator.Persistent);
+            broadphase = new Broadphase(initialBodyCapacity: 16, allocator: Allocator.Persistent);
         }
 
         public void Dispose()
@@ -52,6 +54,7 @@ namespace Shard.Runtime
             slotMap.Dispose();
             colliderStore.Dispose();
             triangleMeshStore.Dispose();
+            broadphase.Dispose();
         }
 
         #region --------- Create Body ----------
@@ -1079,19 +1082,23 @@ namespace Shard.Runtime
             const float kStaticVelEps = 0.05f;  // m/s threshold to treat as �trying to stick�
             const float kRollEps = 1e-8f;
 
-            for (int a = 0; a < poses.Length; a++)
+            broadphase.Rebuild(poses, bodyTypes, colliderStore, triangleMeshStore);
+
+            for (int pairIndex = 0; pairIndex < broadphase.PairCount; pairIndex++)
             {
-                for (int b = a + 1; b < poses.Length; b++)
-                {
-                    bool aDyn = bodyTypes[a] == BodyType.Dynamic;
-                    bool bDyn = bodyTypes[b] == BodyType.Dynamic;
-                    if (!aDyn && !bDyn)
-                        continue;
+                ShardBodyPair pair = broadphase.GetPair(pairIndex);
+                int a = pair.a;
+                int b = pair.b;
 
-                    Pose pa = poses[a];
-                    Pose pb = poses[b];
+                bool aDyn = bodyTypes[a] == BodyType.Dynamic;
+                bool bDyn = bodyTypes[b] == BodyType.Dynamic;
+                if (!aDyn && !bDyn)
+                    continue;
 
-                    bool gotContact = GetContactManifold(a, b, pa, pb, out var cps, out var restitution, out var muS, out var muD, out var muR);
+                Pose pa = poses[a];
+                Pose pb = poses[b];
+
+                bool gotContact = GetContactManifold(a, b, pa, pb, out var cps, out var restitution, out var muS, out var muD, out var muR);
 
                     if (!gotContact)
                         continue;
@@ -1298,9 +1305,8 @@ namespace Shard.Runtime
                         }
                     }
 
-                    velocities[a] = va;
-                    velocities[b] = vb;
-                }
+                velocities[a] = va;
+                velocities[b] = vb;
             }
         }
 
@@ -1433,7 +1439,7 @@ namespace Shard.Runtime
                 if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
                     break;
 
-                if (c.type == ShardColliderType.TriangleMesh &&
+                if (c.type == ShardColliderType.Mesh &&
                     triangleMeshStore.TryGetMeshInfo(c.meshIndex, out meshInfo))
                 {
                     meshCollider = c;

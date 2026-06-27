@@ -10,9 +10,8 @@ namespace Shard.Runtime
         Capsule,
         Cylinder,
         Cone,
-        Mesh,
         Triangle,
-        TriangleMesh,
+        Mesh,
         Voxel
     }
 

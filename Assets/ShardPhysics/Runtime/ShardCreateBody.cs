@@ -104,7 +104,7 @@ namespace Shard.Runtime
         {
             return new ShardCollider
             {
-                type = ShardColliderType.TriangleMesh,
+                type = ShardColliderType.Mesh,
                 material = material,
                 localPose = NormalizePose(localPose),
                 density = density,

@@ -159,7 +159,7 @@ namespace Shard.Runtime
                     aabb.Encapsulate(TransformPoint(worldPose, collider.vertexC));
                     return true;
 
-                case ShardColliderType.TriangleMesh:
+                case ShardColliderType.Mesh:
                     if (!triangleMeshStore.TryGetMeshInfo(collider.meshIndex, out ShardTriangleMeshInfo meshInfo))
                     {
                         aabb = default;
