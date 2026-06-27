@@ -730,121 +730,84 @@ namespace Shard.Runtime
             muR = default;
 
             // ---------- Sphere - Sphere ----------
-            if (TryGetBodySphere(a, out float sphereARadius, out ShardColliderMaterial matSphereA) &&
-                TryGetBodySphere(b, out float sphereBRadius, out ShardColliderMaterial matSphereB))
+            if (TryGetBodySphereShape(a, pa, out SimpleShapeSolvers.Sphere sphereA, out ShardColliderMaterial matSphereA) &&
+                TryGetBodySphereShape(b, pb, out SimpleShapeSolvers.Sphere sphereB, out ShardColliderMaterial matSphereB))
             {
                 CombineMaterials(matSphereA, matSphereB, out restitution, out muS, out muD, out muR);
-
-                var sphereA = new SimpleShapeSolvers.Sphere(pa.position, sphereARadius);
-                var sphereB = new SimpleShapeSolvers.Sphere(pb.position, sphereBRadius);
-
                 return SimpleShapeSolvers.SolveSphereSphere(sphereA, sphereB, out cps);
             }
 
             // ---------- Sphere - Box ----------
-            if (TryGetBodySphere(a, out sphereARadius, out matSphereA) &&
-                TryGetBodyBox(b, out float3 boxBHalf, out ShardColliderMaterial matBoxB))
+            if (TryGetBodySphereShape(a, pa, out sphereA, out matSphereA) &&
+                TryGetBodyBoxShape(b, pb, out SimpleShapeSolvers.Box boxB, out ShardColliderMaterial matBoxB))
             {
                 CombineMaterials(matSphereA, matBoxB, out restitution, out muS, out muD, out muR);
-
-                var sphere = new SimpleShapeSolvers.Sphere(pa.position, sphereARadius);
-                var box = new SimpleShapeSolvers.Box(pb.position, pb.rotation, boxBHalf);
-
-                return SimpleShapeSolvers.SolveSphereBox(sphere, box, out cps);
+                return SimpleShapeSolvers.SolveSphereBox(sphereA, boxB, out cps);
             }
 
             // ---------- Box - Sphere ----------
-            if (TryGetBodyBox(a, out float3 boxAHalf, out ShardColliderMaterial matBoxA) &&
-                TryGetBodySphere(b, out sphereBRadius, out matSphereB))
+            if (TryGetBodyBoxShape(a, pa, out SimpleShapeSolvers.Box boxA, out ShardColliderMaterial matBoxA) &&
+                TryGetBodySphereShape(b, pb, out sphereB, out matSphereB))
             {
                 CombineMaterials(matBoxA, matSphereB, out restitution, out muS, out muD, out muR);
-
-                var box = new SimpleShapeSolvers.Box(pa.position, pa.rotation, boxAHalf);
-                var sphere = new SimpleShapeSolvers.Sphere(pb.position, sphereBRadius);
-
-                return SimpleShapeSolvers.SolveBoxSphere(box, sphere, out cps);
+                return SimpleShapeSolvers.SolveBoxSphere(boxA, sphereB, out cps);
             }
 
             // ---------- Sphere - Capsule ----------
-            if (TryGetBodySphere(a, out sphereARadius, out matSphereA) &&
-                TryGetBodyCapsule(b, out float capsuleBHalfHeight, out float capsuleBRadius, out ShardColliderMaterial matCapsuleB))
+            if (TryGetBodySphereShape(a, pa, out sphereA, out matSphereA) &&
+                TryGetBodyCapsuleShape(b, pb, out SimpleShapeSolvers.Capsule capsuleB, out ShardColliderMaterial matCapsuleB))
             {
                 CombineMaterials(matSphereA, matCapsuleB, out restitution, out muS, out muD, out muR);
-
-                var sphere = new SimpleShapeSolvers.Sphere(pa.position, sphereARadius);
-                var capsule = new SimpleShapeSolvers.Capsule(pb.position, pb.rotation, capsuleBHalfHeight, capsuleBRadius);
-
-                return SimpleShapeSolvers.SolveSphereCapsule(sphere, capsule, out cps);
+                return SimpleShapeSolvers.SolveSphereCapsule(sphereA, capsuleB, out cps);
             }
 
             // ---------- Capsule - Sphere ----------
-            if (TryGetBodyCapsule(a, out float capsuleAHalfHeight, out float capsuleARadius, out ShardColliderMaterial matCapsuleA) &&
-                TryGetBodySphere(b, out sphereBRadius, out matSphereB))
+            if (TryGetBodyCapsuleShape(a, pa, out SimpleShapeSolvers.Capsule capsuleA, out ShardColliderMaterial matCapsuleA) &&
+                TryGetBodySphereShape(b, pb, out sphereB, out matSphereB))
             {
                 CombineMaterials(matCapsuleA, matSphereB, out restitution, out muS, out muD, out muR);
-
-                var capsule = new SimpleShapeSolvers.Capsule(pa.position, pa.rotation, capsuleAHalfHeight, capsuleARadius);
-                var sphere = new SimpleShapeSolvers.Sphere(pb.position, sphereBRadius);
-
-                return SimpleShapeSolvers.SolveCapsuleSphere(capsule, sphere, out cps);
+                return SimpleShapeSolvers.SolveCapsuleSphere(capsuleA, sphereB, out cps);
             }
 
             // ---------- Capsule - Capsule ----------
-            if (TryGetBodyCapsule(a, out capsuleAHalfHeight, out capsuleARadius, out matCapsuleA) &&
-                TryGetBodyCapsule(b, out capsuleBHalfHeight, out capsuleBRadius, out matCapsuleB))
+            if (TryGetBodyCapsuleShape(a, pa, out capsuleA, out matCapsuleA) &&
+                TryGetBodyCapsuleShape(b, pb, out capsuleB, out matCapsuleB))
             {
                 CombineMaterials(matCapsuleA, matCapsuleB, out restitution, out muS, out muD, out muR);
-
-                var capsuleA = new SimpleShapeSolvers.Capsule(pa.position, pa.rotation, capsuleAHalfHeight, capsuleARadius);
-                var capsuleB = new SimpleShapeSolvers.Capsule(pb.position, pb.rotation, capsuleBHalfHeight, capsuleBRadius);
-
                 return SimpleShapeSolvers.SolveCapsuleCapsule(capsuleA, capsuleB, out cps);
             }
 
             // ---------- Capsule - Box ----------
-            if (TryGetBodyCapsule(a, out capsuleAHalfHeight, out capsuleARadius, out matCapsuleA) &&
-                TryGetBodyBox(b, out boxBHalf, out matBoxB))
+            if (TryGetBodyCapsuleShape(a, pa, out capsuleA, out matCapsuleA) &&
+                TryGetBodyBoxShape(b, pb, out boxB, out matBoxB))
             {
                 CombineMaterials(matCapsuleA, matBoxB, out restitution, out muS, out muD, out muR);
-
-                var capsule = new SimpleShapeSolvers.Capsule(pa.position, pa.rotation, capsuleAHalfHeight, capsuleARadius);
-                var box = new SimpleShapeSolvers.Box(pb.position, pb.rotation, boxBHalf);
-
-                return SimpleShapeSolvers.SolveCapsuleBox(capsule, box, out cps);
+                return SimpleShapeSolvers.SolveCapsuleBox(capsuleA, boxB, out cps);
             }
 
             // ---------- Box - Capsule ----------
-            if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
-                TryGetBodyCapsule(b, out capsuleBHalfHeight, out capsuleBRadius, out matCapsuleB))
+            if (TryGetBodyBoxShape(a, pa, out boxA, out matBoxA) &&
+                TryGetBodyCapsuleShape(b, pb, out capsuleB, out matCapsuleB))
             {
                 CombineMaterials(matBoxA, matCapsuleB, out restitution, out muS, out muD, out muR);
-
-                var box = new SimpleShapeSolvers.Box(pa.position, pa.rotation, boxAHalf);
-                var capsule = new SimpleShapeSolvers.Capsule(pb.position, pb.rotation, capsuleBHalfHeight, capsuleBRadius);
-
-                return SimpleShapeSolvers.SolveBoxCapsule(box, capsule, out cps);
+                return SimpleShapeSolvers.SolveBoxCapsule(boxA, capsuleB, out cps);
             }
 
             // ---------- Sphere - Triangle ----------
-            if (TryGetBodySphere(a, out sphereARadius, out matSphereA) &&
+            if (TryGetBodySphereShape(a, pa, out sphereA, out matSphereA) &&
                 TryGetBodyTriangle(b, pb, out SimpleShapeSolvers.Triangle triangleB, out ShardColliderMaterial matTriangleB))
             {
                 CombineMaterials(matSphereA, matTriangleB, out restitution, out muS, out muD, out muR);
-
-                var sphere = new SimpleShapeSolvers.Sphere(pa.position, sphereARadius);
-
-                return SimpleShapeSolvers.SolveSphereTriangle(sphere, triangleB, out cps);
+                return SimpleShapeSolvers.SolveSphereTriangle(sphereA, triangleB, out cps);
             }
 
             // ---------- Triangle - Sphere ----------
             if (TryGetBodyTriangle(a, pa, out SimpleShapeSolvers.Triangle triangleA, out ShardColliderMaterial matTriangleA) &&
-                TryGetBodySphere(b, out sphereBRadius, out matSphereB))
+                TryGetBodySphereShape(b, pb, out sphereB, out matSphereB))
             {
                 CombineMaterials(matTriangleA, matSphereB, out restitution, out muS, out muD, out muR);
 
-                var sphere = new SimpleShapeSolvers.Sphere(pb.position, sphereBRadius);
-
-                if (!SimpleShapeSolvers.SolveSphereTriangle(sphere, triangleA, out cps))
+                if (!SimpleShapeSolvers.SolveSphereTriangle(sphereB, triangleA, out cps))
                     return false;
 
                 SimpleShapeSolvers.FlipManifold(ref cps);
@@ -852,25 +815,20 @@ namespace Shard.Runtime
             }
 
             // ---------- Capsule - Triangle ----------
-            if (TryGetBodyCapsule(a, out capsuleAHalfHeight, out capsuleARadius, out matCapsuleA) &&
+            if (TryGetBodyCapsuleShape(a, pa, out capsuleA, out matCapsuleA) &&
                 TryGetBodyTriangle(b, pb, out triangleB, out matTriangleB))
             {
                 CombineMaterials(matCapsuleA, matTriangleB, out restitution, out muS, out muD, out muR);
-
-                var capsule = new SimpleShapeSolvers.Capsule(pa.position, pa.rotation, capsuleAHalfHeight, capsuleARadius);
-
-                return SimpleShapeSolvers.SolveCapsuleTriangle(capsule, triangleB, out cps);
+                return SimpleShapeSolvers.SolveCapsuleTriangle(capsuleA, triangleB, out cps);
             }
 
             // ---------- Triangle - Capsule ----------
             if (TryGetBodyTriangle(a, pa, out triangleA, out matTriangleA) &&
-                TryGetBodyCapsule(b, out capsuleBHalfHeight, out capsuleBRadius, out matCapsuleB))
+                TryGetBodyCapsuleShape(b, pb, out capsuleB, out matCapsuleB))
             {
                 CombineMaterials(matTriangleA, matCapsuleB, out restitution, out muS, out muD, out muR);
 
-                var capsule = new SimpleShapeSolvers.Capsule(pb.position, pb.rotation, capsuleBHalfHeight, capsuleBRadius);
-
-                if (!SimpleShapeSolvers.SolveCapsuleTriangle(capsule, triangleA, out cps))
+                if (!SimpleShapeSolvers.SolveCapsuleTriangle(capsuleB, triangleA, out cps))
                     return false;
 
                 SimpleShapeSolvers.FlipManifold(ref cps);
@@ -878,29 +836,23 @@ namespace Shard.Runtime
             }
 
             // ---------- Box - Triangle ----------
-            if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
+            if (TryGetBodyBoxShape(a, pa, out boxA, out matBoxA) &&
                 TryGetBodyTriangle(b, pb, out triangleB, out matTriangleB))
             {
                 CombineMaterials(matBoxA, matTriangleB, out restitution, out muS, out muD, out muR);
-
-                var box = new SimpleShapeSolvers.Box(pa.position, pa.rotation, boxAHalf);
-
-                return SimpleShapeSolvers.SolveBoxTriangle(box, triangleB, out cps);
+                return SimpleShapeSolvers.SolveBoxTriangle(boxA, triangleB, out cps);
             }
 
             // ---------- Triangle - Box ----------
             if (TryGetBodyTriangle(a, pa, out triangleA, out matTriangleA) &&
-                TryGetBodyBox(b, out boxBHalf, out matBoxB))
+                TryGetBodyBoxShape(b, pb, out boxB, out matBoxB))
             {
                 CombineMaterials(matTriangleA, matBoxB, out restitution, out muS, out muD, out muR);
-
-                var box = new SimpleShapeSolvers.Box(pb.position, pb.rotation, boxBHalf);
-
-                return SimpleShapeSolvers.SolveTriangleBox(triangleA, box, out cps);
+                return SimpleShapeSolvers.SolveTriangleBox(triangleA, boxB, out cps);
             }
 
             // ---------- Sphere - TriangleMesh ----------
-            if (TryGetBodySphere(a, out sphereARadius, out matSphereA) &&
+            if (TryGetBodySphereShape(a, pa, out sphereA, out matSphereA) &&
                 TryGetBodyTriangleMesh(
                     b,
                     pb,
@@ -911,10 +863,8 @@ namespace Shard.Runtime
             {
                 CombineMaterials(matSphereA, matMeshB, out restitution, out muS, out muD, out muR);
 
-                var sphere = new SimpleShapeSolvers.Sphere(pa.position, sphereARadius);
-
                 return SolveSphereTriangleMesh(
-                    sphere,
+                    sphereA,
                     meshColliderB.meshIndex,
                     meshInfoB,
                     meshPoseB,
@@ -929,14 +879,12 @@ namespace Shard.Runtime
                     out Pose meshPoseA,
                     out ShardTriangleMeshInfo meshInfoA,
                     out ShardColliderMaterial matMeshA) &&
-                TryGetBodySphere(b, out sphereBRadius, out matSphereB))
+                TryGetBodySphereShape(b, pb, out sphereB, out matSphereB))
             {
                 CombineMaterials(matMeshA, matSphereB, out restitution, out muS, out muD, out muR);
 
-                var sphere = new SimpleShapeSolvers.Sphere(pb.position, sphereBRadius);
-
                 if (!SolveSphereTriangleMesh(
-                        sphere,
+                        sphereB,
                         meshColliderA.meshIndex,
                         meshInfoA,
                         meshPoseA,
@@ -948,15 +896,13 @@ namespace Shard.Runtime
             }
 
             // ---------- Capsule - TriangleMesh ----------
-            if (TryGetBodyCapsule(a, out capsuleAHalfHeight, out capsuleARadius, out matCapsuleA) &&
+            if (TryGetBodyCapsuleShape(a, pa, out capsuleA, out matCapsuleA) &&
                 TryGetBodyTriangleMesh(b, pb, out meshColliderB, out meshPoseB, out meshInfoB, out matMeshB))
             {
                 CombineMaterials(matCapsuleA, matMeshB, out restitution, out muS, out muD, out muR);
 
-                var capsule = new SimpleShapeSolvers.Capsule(pa.position, pa.rotation, capsuleAHalfHeight, capsuleARadius);
-
                 return SolveCapsuleTriangleMesh(
-                    capsule,
+                    capsuleA,
                     meshColliderB.meshIndex,
                     meshInfoB,
                     meshPoseB,
@@ -965,14 +911,12 @@ namespace Shard.Runtime
 
             // ---------- TriangleMesh - Capsule ----------
             if (TryGetBodyTriangleMesh(a, pa, out meshColliderA, out meshPoseA, out meshInfoA, out matMeshA) &&
-                TryGetBodyCapsule(b, out capsuleBHalfHeight, out capsuleBRadius, out matCapsuleB))
+                TryGetBodyCapsuleShape(b, pb, out capsuleB, out matCapsuleB))
             {
                 CombineMaterials(matMeshA, matCapsuleB, out restitution, out muS, out muD, out muR);
 
-                var capsule = new SimpleShapeSolvers.Capsule(pb.position, pb.rotation, capsuleBHalfHeight, capsuleBRadius);
-
                 if (!SolveCapsuleTriangleMesh(
-                        capsule,
+                        capsuleB,
                         meshColliderA.meshIndex,
                         meshInfoA,
                         meshPoseA,
@@ -982,17 +926,15 @@ namespace Shard.Runtime
                 SimpleShapeSolvers.FlipManifold(ref cps);
                 return true;
             }
-            
+
             // ---------- Box - TriangleMesh ----------
-            if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
+            if (TryGetBodyBoxShape(a, pa, out boxA, out matBoxA) &&
                 TryGetBodyTriangleMesh(b, pb, out meshColliderB, out meshPoseB, out meshInfoB, out matMeshB))
             {
                 CombineMaterials(matBoxA, matMeshB, out restitution, out muS, out muD, out muR);
 
-                var box = new SimpleShapeSolvers.Box(pa.position, pa.rotation, boxAHalf);
-
                 return SolveBoxTriangleMesh(
-                    box,
+                    boxA,
                     meshColliderB.meshIndex,
                     meshInfoB,
                     meshPoseB,
@@ -1001,14 +943,12 @@ namespace Shard.Runtime
 
             // ---------- TriangleMesh - Box ----------
             if (TryGetBodyTriangleMesh(a, pa, out meshColliderA, out meshPoseA, out meshInfoA, out matMeshA) &&
-                TryGetBodyBox(b, out boxBHalf, out matBoxB))
+                TryGetBodyBoxShape(b, pb, out boxB, out matBoxB))
             {
                 CombineMaterials(matMeshA, matBoxB, out restitution, out muS, out muD, out muR);
 
-                var box = new SimpleShapeSolvers.Box(pb.position, pb.rotation, boxBHalf);
-
                 if (!SolveBoxTriangleMesh(
-                        box,
+                        boxB,
                         meshColliderA.meshIndex,
                         meshInfoA,
                         meshPoseA,
@@ -1020,19 +960,20 @@ namespace Shard.Runtime
             }
 
             // ---------- Box - Box ----------
-            if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
-                TryGetBodyBox(b, out boxBHalf, out matBoxB))
+            if (TryGetBodyBoxShape(a, pa, out boxA, out matBoxA) &&
+                TryGetBodyBoxShape(b, pb, out boxB, out matBoxB))
             {
                 CombineMaterials(matBoxA, matBoxB, out restitution, out muS, out muD, out muR);
 
-                var boxA = new BoxBoxSolver.Box(pa.position, pa.rotation, boxAHalf);
-                var boxB = new BoxBoxSolver.Box(pb.position, pb.rotation, boxBHalf);
+                var solverBoxA = new BoxBoxSolver.Box(boxA.center, boxA.rotation, boxA.halfExtents);
+                var solverBoxB = new BoxBoxSolver.Box(boxB.center, boxB.rotation, boxB.halfExtents);
 
-                return BoxBoxSolver.Solve(boxA, boxB, out cps);
+                return BoxBoxSolver.Solve(solverBoxA, solverBoxB, out cps);
             }
 
             // ---------- Box - Cylinder ----------
-            if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
+            // Cylinders are currently ignored for localPose correctness work.
+            if (TryGetBodyBox(a, out float3 boxAHalf, out matBoxA) &&
                 TryGetBodyCylinder(b, out float cylBHalfHeight, out float cylBRadius, out ShardColliderMaterial matCylB))
             {
                 CombineMaterials(matBoxA, matCylB, out restitution, out muS, out muD, out muR);
@@ -1044,8 +985,9 @@ namespace Shard.Runtime
             }
 
             // ---------- Cylinder - Box ----------
+            // Cylinders are currently ignored for localPose correctness work.
             if (TryGetBodyCylinder(a, out float cylAHalfHeight, out float cylARadius, out ShardColliderMaterial matCylA) &&
-                TryGetBodyBox(b, out boxBHalf, out matBoxB))
+                TryGetBodyBox(b, out float3 boxBHalf, out matBoxB))
             {
                 CombineMaterials(matCylA, matBoxB, out restitution, out muS, out muD, out muR);
 
@@ -1060,6 +1002,7 @@ namespace Shard.Runtime
             }
 
             // ---------- Cylinder - Cylinder ----------
+            // Cylinders are currently ignored for localPose correctness work.
             if (TryGetBodyCylinder(a, out cylAHalfHeight, out cylARadius, out matCylA) &&
                 TryGetBodyCylinder(b, out cylBHalfHeight, out cylBRadius, out matCylB))
             {
@@ -1311,6 +1254,100 @@ namespace Shard.Runtime
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetBodySphereShape(
+            int dense,
+            Pose bodyPose,
+            out SimpleShapeSolvers.Sphere sphere,
+            out ShardColliderMaterial mat)
+        {
+            int n = colliderStore.GetHead(dense);
+            while (n != -1)
+            {
+                if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
+                    break;
+
+                if (c.type == ShardColliderType.Sphere)
+                {
+                    Pose colliderPose = ComposePose(bodyPose, c.localPose);
+                    sphere = new SimpleShapeSolvers.Sphere(colliderPose.position, math.max(0f, c.radius));
+                    mat = c.material;
+                    return true;
+                }
+
+                n = next;
+            }
+
+            sphere = default;
+            mat = default;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetBodyBoxShape(
+            int dense,
+            Pose bodyPose,
+            out SimpleShapeSolvers.Box box,
+            out ShardColliderMaterial mat)
+        {
+            int n = colliderStore.GetHead(dense);
+            while (n != -1)
+            {
+                if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
+                    break;
+
+                if (c.type == ShardColliderType.Box)
+                {
+                    Pose colliderPose = ComposePose(bodyPose, c.localPose);
+                    box = new SimpleShapeSolvers.Box(
+                        colliderPose.position,
+                        colliderPose.rotation,
+                        math.max(c.halfExtents, float3.zero));
+                    mat = c.material;
+                    return true;
+                }
+
+                n = next;
+            }
+
+            box = default;
+            mat = default;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetBodyCapsuleShape(
+            int dense,
+            Pose bodyPose,
+            out SimpleShapeSolvers.Capsule capsule,
+            out ShardColliderMaterial mat)
+        {
+            int n = colliderStore.GetHead(dense);
+            while (n != -1)
+            {
+                if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
+                    break;
+
+                if (c.type == ShardColliderType.Capsule)
+                {
+                    Pose colliderPose = ComposePose(bodyPose, c.localPose);
+                    capsule = new SimpleShapeSolvers.Capsule(
+                        colliderPose.position,
+                        colliderPose.rotation,
+                        math.max(0f, c.height * 0.5f),
+                        math.max(0f, c.radius));
+                    mat = c.material;
+                    return true;
+                }
+
+                n = next;
+            }
+
+            capsule = default;
+            mat = default;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool TryGetBodyBox(int dense, out float3 halfExtents, out ShardColliderMaterial mat)
         {
             int n = colliderStore.GetHead(dense);
@@ -1469,6 +1506,42 @@ namespace Shard.Runtime
                 TransformPoint(meshWorldPose, localTriangle.c));
         }
         
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Aabb ComputeSphereAabb(SimpleShapeSolvers.Sphere sphere)
+        {
+            float r = math.max(0f, sphere.radius);
+            return new Aabb(sphere.center - new float3(r), sphere.center + new float3(r));
+        }
+
+        private static Aabb ComputeBoxAabb(SimpleShapeSolvers.Box box)
+        {
+            float3x3 r = new float3x3(box.rotation);
+
+            float3 extents =
+                math.abs(r.c0) * box.halfExtents.x +
+                math.abs(r.c1) * box.halfExtents.y +
+                math.abs(r.c2) * box.halfExtents.z;
+
+            return new Aabb(box.center - extents, box.center + extents);
+        }
+
+        private static Aabb ComputeCapsuleAabb(SimpleShapeSolvers.Capsule capsule)
+        {
+            float3 axis = math.mul(capsule.rotation, new float3(0f, 1f, 0f));
+            float3 extents = math.abs(axis) * capsule.halfHeight + new float3(capsule.radius);
+            return new Aabb(capsule.center - extents, capsule.center + extents);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Aabb ComputeTriangleAabb(SimpleShapeSolvers.Triangle triangle)
+        {
+            Aabb aabb = Aabb.Empty;
+            aabb.Encapsulate(triangle.a);
+            aabb.Encapsulate(triangle.b);
+            aabb.Encapsulate(triangle.c);
+            return aabb;
+        }
+
         private bool SolveSphereTriangleMesh(
             SimpleShapeSolvers.Sphere sphere,
             int meshIndex,
@@ -1477,6 +1550,8 @@ namespace Shard.Runtime
             out ContactPointManifold manifold)
         {
             manifold = default;
+
+            Aabb queryAabb = ComputeSphereAabb(sphere);
 
             bool hit = false;
             float deepest = float.NegativeInfinity;
@@ -1489,6 +1564,9 @@ namespace Shard.Runtime
 
                 SimpleShapeSolvers.Triangle worldTriangle =
                     TransformTriangle(localTriangle, meshWorldPose);
+
+                if (!queryAabb.Overlaps(ComputeTriangleAabb(worldTriangle)))
+                    continue;
 
                 if (!SimpleShapeSolvers.SolveSphereTriangle(
                         sphere,
@@ -1587,6 +1665,8 @@ namespace Shard.Runtime
         {
             manifold = default;
 
+            Aabb queryAabb = ComputeBoxAabb(box);
+
             bool hit = false;
             float deepest = float.NegativeInfinity;
             float3 accumulatedNormal = float3.zero;
@@ -1598,6 +1678,9 @@ namespace Shard.Runtime
 
                 SimpleShapeSolvers.Triangle worldTriangle =
                     TransformTriangle(localTriangle, meshWorldPose);
+
+                if (!queryAabb.Overlaps(ComputeTriangleAabb(worldTriangle)))
+                    continue;
 
                 if (!SimpleShapeSolvers.SolveBoxTriangle(
                         box,
@@ -1632,6 +1715,8 @@ namespace Shard.Runtime
         {
             manifold = default;
 
+            Aabb queryAabb = ComputeCapsuleAabb(capsule);
+
             bool hit = false;
             float deepest = float.NegativeInfinity;
             float3 accumulatedNormal = float3.zero;
@@ -1643,6 +1728,9 @@ namespace Shard.Runtime
 
                 SimpleShapeSolvers.Triangle worldTriangle =
                     TransformTriangle(localTriangle, meshWorldPose);
+
+                if (!queryAabb.Overlaps(ComputeTriangleAabb(worldTriangle)))
+                    continue;
 
                 if (!SimpleShapeSolvers.SolveCapsuleTriangle(
                         capsule,
