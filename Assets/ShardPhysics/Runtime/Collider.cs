@@ -36,9 +36,13 @@ namespace Shard.Runtime
         public float3 halfExtents;
         public float height;
 
+        // Used only by single Triangle collider.
         public float3 vertexA;
         public float3 vertexB;
         public float3 vertexC;
+
+        // Used only by TriangleMesh collider.
+        // This is an index into ShardTriangleMeshStore.
         public int meshIndex;
     }
 }

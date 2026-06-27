@@ -96,11 +96,8 @@ namespace Shard.Runtime
             };
         }
 
-        public static ShardCollider CreateTriangleMeshProxy(
-            float3 a,
-            float3 b,
-            float3 c,
-            int meshIndex = -1,
+        public static ShardCollider CreateTriangleMesh(
+            ShardTriangleMeshHandle meshHandle,
             float density = 0f,
             Pose localPose = default,
             ShardColliderMaterial material = default)
@@ -111,10 +108,7 @@ namespace Shard.Runtime
                 material = material,
                 localPose = NormalizePose(localPose),
                 density = density,
-                vertexA = a,
-                vertexB = b,
-                vertexC = c,
-                meshIndex = meshIndex
+                meshIndex = meshHandle.value
             };
         }
 

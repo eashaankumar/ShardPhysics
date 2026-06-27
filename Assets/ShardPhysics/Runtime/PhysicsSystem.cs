@@ -18,6 +18,7 @@ namespace Shard.Runtime
 
         DenseSlotMap slotMap;
         ShardColliderStore colliderStore;
+        ShardTriangleMeshStore triangleMeshStore;
 
         public float3 gravity;
 
@@ -31,6 +32,12 @@ namespace Shard.Runtime
             bodyTypes = new NativeList<BodyType>(Allocator.Persistent);
 
             colliderStore = new ShardColliderStore(initialNodeCapacity: 32, initialBodyCapacity: 16, allocator: Allocator.Persistent);
+            triangleMeshStore = new ShardTriangleMeshStore(
+                initialVertexCapacity: 1024,
+                initialIndexCapacity: 2048,
+                initialMeshCapacity: 32,
+                allocator: Allocator.Persistent);
+            
             slotMap = new DenseSlotMap(initialCapacity: 16, allocator: Allocator.Persistent);
         }
 
@@ -44,6 +51,7 @@ namespace Shard.Runtime
             if (bodyTypes.IsCreated) bodyTypes.Dispose();
             slotMap.Dispose();
             colliderStore.Dispose();
+            triangleMeshStore.Dispose();
         }
 
         #region --------- Create Body ----------
@@ -316,6 +324,59 @@ namespace Shard.Runtime
                 return 0;
             return colliderStore.GetColliderCount(d);
         }
+        #endregion
+        
+        #region ---------- Triangle Meshes ----------
+
+        public ShardTriangleMeshHandle AddTriangleMesh(
+            NativeArray<float3> vertices,
+            NativeArray<int> indices)
+        {
+            return triangleMeshStore.AddMesh(vertices, indices);
+        }
+
+        public ShardTriangleMeshHandle AddTriangleMesh(
+            ReadOnlySpan<float3> vertices,
+            ReadOnlySpan<int> indices)
+        {
+            return triangleMeshStore.AddMesh(vertices, indices);
+        }
+
+        public bool RemoveTriangleMesh(ShardTriangleMeshHandle mesh)
+        {
+            return triangleMeshStore.RemoveMesh(mesh);
+        }
+
+        public bool TryGetTriangleMeshInfo(
+            ShardTriangleMeshHandle mesh,
+            out ShardTriangleMeshInfo info)
+        {
+            return triangleMeshStore.TryGetMeshInfo(mesh, out info);
+        }
+
+        public bool TryGetTriangleMeshInfo(
+            int meshIndex,
+            out ShardTriangleMeshInfo info)
+        {
+            return triangleMeshStore.TryGetMeshInfo(meshIndex, out info);
+        }
+
+        public bool TryGetTriangle(
+            ShardTriangleMeshHandle mesh,
+            int triangleIndex,
+            out ShardTriangle triangle)
+        {
+            return triangleMeshStore.TryGetTriangle(mesh, triangleIndex, out triangle);
+        }
+
+        public bool TryGetTriangle(
+            int meshIndex,
+            int triangleIndex,
+            out ShardTriangle triangle)
+        {
+            return triangleMeshStore.TryGetTriangle(meshIndex, triangleIndex, out triangle);
+        }
+
         #endregion
 
         #region ---------- Handle -> dense resolution ----------
@@ -812,6 +873,114 @@ namespace Shard.Runtime
                 SimpleShapeSolvers.FlipManifold(ref cps);
                 return true;
             }
+            
+            // ---------- Sphere - TriangleMesh ----------
+            if (TryGetBodySphere(a, out sphereARadius, out matSphereA) &&
+                TryGetBodyTriangleMesh(
+                    b,
+                    pb,
+                    out ShardCollider meshColliderB,
+                    out Pose meshPoseB,
+                    out ShardTriangleMeshInfo meshInfoB,
+                    out ShardColliderMaterial matMeshB))
+            {
+                CombineMaterials(matSphereA, matMeshB, out restitution, out muS, out muD, out muR);
+
+                var sphere = new SimpleShapeSolvers.Sphere(pa.position, sphereARadius);
+
+                return SolveSphereTriangleMesh(
+                    sphere,
+                    meshColliderB.meshIndex,
+                    meshInfoB,
+                    meshPoseB,
+                    out cps);
+            }
+
+            // ---------- TriangleMesh - Sphere ----------
+            if (TryGetBodyTriangleMesh(
+                    a,
+                    pa,
+                    out ShardCollider meshColliderA,
+                    out Pose meshPoseA,
+                    out ShardTriangleMeshInfo meshInfoA,
+                    out ShardColliderMaterial matMeshA) &&
+                TryGetBodySphere(b, out sphereBRadius, out matSphereB))
+            {
+                CombineMaterials(matMeshA, matSphereB, out restitution, out muS, out muD, out muR);
+
+                var sphere = new SimpleShapeSolvers.Sphere(pb.position, sphereBRadius);
+
+                if (!SolveSphereTriangleMesh(
+                        sphere,
+                        meshColliderA.meshIndex,
+                        meshInfoA,
+                        meshPoseA,
+                        out cps))
+                {
+                    return false;
+                }
+
+                SimpleShapeSolvers.FlipManifold(ref cps);
+                return true;
+            }
+
+            // ---------- Capsule - TriangleMesh ----------
+            if (TryGetBodyCapsule(a, out capsuleAHalfHeight, out capsuleARadius, out matCapsuleA) &&
+                TryGetBodyTriangleMesh(
+                    b,
+                    pb,
+                    out meshColliderB,
+                    out meshPoseB,
+                    out meshInfoB,
+                    out matMeshB))
+            {
+                CombineMaterials(matCapsuleA, matMeshB, out restitution, out muS, out muD, out muR);
+
+                var capsule = new SimpleShapeSolvers.Capsule(
+                    pa.position,
+                    pa.rotation,
+                    capsuleAHalfHeight,
+                    capsuleARadius);
+
+                return SolveCapsuleTriangleMesh(
+                    capsule,
+                    meshColliderB.meshIndex,
+                    meshInfoB,
+                    meshPoseB,
+                    out cps);
+            }
+
+            // ---------- TriangleMesh - Capsule ----------
+            if (TryGetBodyTriangleMesh(
+                    a,
+                    pa,
+                    out meshColliderA,
+                    out meshPoseA,
+                    out meshInfoA,
+                    out matMeshA) &&
+                TryGetBodyCapsule(b, out capsuleBHalfHeight, out capsuleBRadius, out matCapsuleB))
+            {
+                CombineMaterials(matMeshA, matCapsuleB, out restitution, out muS, out muD, out muR);
+
+                var capsule = new SimpleShapeSolvers.Capsule(
+                    pb.position,
+                    pb.rotation,
+                    capsuleBHalfHeight,
+                    capsuleBRadius);
+
+                if (!SolveCapsuleTriangleMesh(
+                        capsule,
+                        meshColliderA.meshIndex,
+                        meshInfoA,
+                        meshPoseA,
+                        out cps))
+                {
+                    return false;
+                }
+
+                SimpleShapeSolvers.FlipManifold(ref cps);
+                return true;
+            }
 
             // ---------- Box - Box ----------
             if (TryGetBodyBox(a, out boxAHalf, out matBoxA) &&
@@ -1194,7 +1363,7 @@ namespace Shard.Runtime
                 if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
                     break;
 
-                if (c.type == ShardColliderType.Triangle || c.type == ShardColliderType.TriangleMesh)
+                if (c.type == ShardColliderType.Triangle)
                 {
                     Pose colliderPose = ComposePose(bodyPose, c.localPose);
 
@@ -1213,6 +1382,129 @@ namespace Shard.Runtime
             triangle = default;
             mat = default;
             return false;
+        }
+        
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetBodyTriangleMesh(
+            int dense,
+            Pose bodyPose,
+            out ShardCollider meshCollider,
+            out Pose meshWorldPose,
+            out ShardTriangleMeshInfo meshInfo,
+            out ShardColliderMaterial mat)
+        {
+            int n = colliderStore.GetHead(dense);
+            while (n != -1)
+            {
+                if (!colliderStore.TryGetNode(n, out ShardCollider c, out int next))
+                    break;
+
+                if (c.type == ShardColliderType.TriangleMesh &&
+                    triangleMeshStore.TryGetMeshInfo(c.meshIndex, out meshInfo))
+                {
+                    meshCollider = c;
+                    meshWorldPose = ComposePose(bodyPose, c.localPose);
+                    mat = c.material;
+                    return true;
+                }
+
+                n = next;
+            }
+
+            meshCollider = default;
+            meshWorldPose = default;
+            meshInfo = default;
+            mat = default;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static SimpleShapeSolvers.Triangle TransformTriangle(
+            in ShardTriangle localTriangle,
+            in Pose meshWorldPose)
+        {
+            return new SimpleShapeSolvers.Triangle(
+                TransformPoint(meshWorldPose, localTriangle.a),
+                TransformPoint(meshWorldPose, localTriangle.b),
+                TransformPoint(meshWorldPose, localTriangle.c));
+        }
+        
+        private bool SolveSphereTriangleMesh(
+            SimpleShapeSolvers.Sphere sphere,
+            int meshIndex,
+            ShardTriangleMeshInfo meshInfo,
+            Pose meshWorldPose,
+            out ContactPointManifold bestManifold)
+        {
+            bestManifold = default;
+
+            bool hit = false;
+            float bestDepth = float.NegativeInfinity;
+
+            for (int i = 0; i < meshInfo.triangleCount; i++)
+            {
+                if (!triangleMeshStore.TryGetTriangle(meshIndex, i, out ShardTriangle localTriangle))
+                    continue;
+
+                SimpleShapeSolvers.Triangle worldTriangle =
+                    TransformTriangle(localTriangle, meshWorldPose);
+
+                if (!SimpleShapeSolvers.SolveSphereTriangle(
+                        sphere,
+                        worldTriangle,
+                        out ContactPointManifold candidate))
+                {
+                    continue;
+                }
+
+                if (!hit || candidate.globalPenDepth > bestDepth)
+                {
+                    hit = true;
+                    bestDepth = candidate.globalPenDepth;
+                    bestManifold = candidate;
+                }
+            }
+
+            return hit;
+        }
+
+        private bool SolveCapsuleTriangleMesh(
+            SimpleShapeSolvers.Capsule capsule,
+            int meshIndex,
+            ShardTriangleMeshInfo meshInfo,
+            Pose meshWorldPose,
+            out ContactPointManifold bestManifold)
+        {
+            bestManifold = default;
+
+            bool hit = false;
+            float bestDepth = float.NegativeInfinity;
+
+            for (int i = 0; i < meshInfo.triangleCount; i++)
+            {
+                if (!triangleMeshStore.TryGetTriangle(meshIndex, i, out ShardTriangle localTriangle))
+                    continue;
+
+                SimpleShapeSolvers.Triangle worldTriangle =
+                    TransformTriangle(localTriangle, meshWorldPose);
+
+                if (!SimpleShapeSolvers.SolveCapsuleTriangle(
+                        capsule,
+                        worldTriangle,
+                        out ContactPointManifold candidate))
+                {
+                    continue;
+                }
+
+                if (!hit || candidate.globalPenDepth > bestDepth)
+                {
+                    hit = true;
+                    bestDepth = candidate.globalPenDepth;
+                    bestManifold = candidate;
+                }
+            }
+
+            return hit;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
