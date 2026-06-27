@@ -20,6 +20,18 @@ namespace Shard.Runtime
         ShardColliderStore colliderStore;
         ShardTriangleMeshStore triangleMeshStore;
         Broadphase broadphase;
+        NativeList<CachedContact> cachedContacts;
+
+        private struct CachedContact
+        {
+            public int a;
+            public int b;
+            public ContactPointManifold cps;
+            public float restitution;
+            public float muS;
+            public float muD;
+            public float muR;
+        }
 
         public float3 gravity;
 
@@ -41,6 +53,7 @@ namespace Shard.Runtime
             
             slotMap = new DenseSlotMap(initialCapacity: 16, allocator: Allocator.Persistent);
             broadphase = new Broadphase(initialBodyCapacity: 16, allocator: Allocator.Persistent);
+            cachedContacts = new NativeList<CachedContact>(initialCapacity: 64, allocator: Allocator.Persistent);
         }
 
         public void Dispose()
@@ -55,6 +68,7 @@ namespace Shard.Runtime
             colliderStore.Dispose();
             triangleMeshStore.Dispose();
             broadphase.Dispose();
+            if (cachedContacts.IsCreated) cachedContacts.Dispose();
         }
 
         #region --------- Create Body ----------
@@ -705,9 +719,13 @@ namespace Shard.Runtime
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SolveCollisions(float dt, int iterations = 6)
         {
+            // Expensive collision detection now happens once per substep.
+            // The solver iterations only reuse the cached contact manifolds.
+            BuildCachedContactsForSubstep();
+
             for (int iter = 0; iter < iterations; iter++)
             {
-                SolveCollisionsSinglePass(dt);
+                SolveCachedContacts(dt, applyBias: iter == 0);
             }
         }
 
@@ -848,18 +866,17 @@ namespace Shard.Runtime
                 TryGetBodyBoxShape(b, pb, out boxB, out matBoxB))
             {
                 CombineMaterials(matTriangleA, matBoxB, out restitution, out muS, out muD, out muR);
-                return SimpleShapeSolvers.SolveTriangleBox(triangleA, boxB, out cps);
+
+                if (!SimpleShapeSolvers.SolveBoxTriangle(boxB, triangleA, out cps))
+                    return false;
+
+                SimpleShapeSolvers.FlipManifold(ref cps);
+                return true;
             }
 
             // ---------- Sphere - TriangleMesh ----------
             if (TryGetBodySphereShape(a, pa, out sphereA, out matSphereA) &&
-                TryGetBodyTriangleMesh(
-                    b,
-                    pb,
-                    out ShardCollider meshColliderB,
-                    out Pose meshPoseB,
-                    out ShardTriangleMeshInfo meshInfoB,
-                    out ShardColliderMaterial matMeshB))
+                TryGetBodyTriangleMesh(b, pb, out ShardCollider meshColliderB, out Pose meshPoseB, out ShardTriangleMeshInfo meshInfoB, out ShardColliderMaterial matMeshB))
             {
                 CombineMaterials(matSphereA, matMeshB, out restitution, out muS, out muD, out muR);
 
@@ -872,13 +889,7 @@ namespace Shard.Runtime
             }
 
             // ---------- TriangleMesh - Sphere ----------
-            if (TryGetBodyTriangleMesh(
-                    a,
-                    pa,
-                    out ShardCollider meshColliderA,
-                    out Pose meshPoseA,
-                    out ShardTriangleMeshInfo meshInfoA,
-                    out ShardColliderMaterial matMeshA) &&
+            if (TryGetBodyTriangleMesh(a, pa, out ShardCollider meshColliderA, out Pose meshPoseA, out ShardTriangleMeshInfo meshInfoA, out ShardColliderMaterial matMeshA) &&
                 TryGetBodySphereShape(b, pb, out sphereB, out matSphereB))
             {
                 CombineMaterials(matMeshA, matSphereB, out restitution, out muS, out muD, out muR);
@@ -1018,13 +1029,13 @@ namespace Shard.Runtime
         }
         
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SolveCollisionsSinglePass(float dt)
+        private void BuildCachedContactsForSubstep()
         {
-            const float kImpulseSlop = 1e-6f;
             const float kDepthSlop = 1e-5f;
-            const float kStaticVelEps = 0.05f;  // m/s threshold to treat as �trying to stick�
-            const float kRollEps = 1e-8f;
 
+            cachedContacts.Clear();
+
+            // Broadphase is now rebuilt once per substep, not once per solver iteration.
             broadphase.Rebuild(poses, bodyTypes, colliderStore, triangleMeshStore);
 
             for (int pairIndex = 0; pairIndex < broadphase.PairCount; pairIndex++)
@@ -1041,212 +1052,248 @@ namespace Shard.Runtime
                 Pose pa = poses[a];
                 Pose pb = poses[b];
 
-                bool gotContact = GetContactManifold(a, b, pa, pb, out var cps, out var restitution, out var muS, out var muD, out var muR);
+                bool gotContact = GetContactManifold(
+                    a,
+                    b,
+                    pa,
+                    pb,
+                    out ContactPointManifold cps,
+                    out float restitution,
+                    out float muS,
+                    out float muD,
+                    out float muR);
 
-                    if (!gotContact)
+                if (!gotContact)
+                    continue;
+
+                float3 globalN = cps.globalPenAxis; // A -> B
+                float depth = cps.globalPenDepth;
+                if (depth <= kDepthSlop)
+                    continue;
+
+                // Positional correction happens once when contacts are built.
+                // Iterations should solve impulses only; otherwise cached depth would be applied repeatedly.
+                if (aDyn && bDyn)
+                {
+                    float3 corr = globalN * (depth * 0.5f);
+                    pa.position -= corr;
+                    pb.position += corr;
+                    poses[a] = pa;
+                    poses[b] = pb;
+                }
+                else if (aDyn && !bDyn)
+                {
+                    pa.position -= globalN * depth;
+                    poses[a] = pa;
+                }
+                else if (!aDyn && bDyn)
+                {
+                    pb.position += globalN * depth;
+                    poses[b] = pb;
+                }
+
+                if (cps.numContactPoints <= 0)
+                    continue;
+
+                cachedContacts.Add(new CachedContact
+                {
+                    a = a,
+                    b = b,
+                    cps = cps,
+                    restitution = restitution,
+                    muS = muS,
+                    muD = muD,
+                    muR = muR
+                });
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SolveCachedContacts(float dt, bool applyBias)
+        {
+            const float kStaticVelEps = 0.05f;  // m/s threshold to treat as trying to stick
+            const float kRollEps = 1e-8f;
+
+            for (int contactIndex = 0; contactIndex < cachedContacts.Length; contactIndex++)
+            {
+                CachedContact contact = cachedContacts[contactIndex];
+
+                int a = contact.a;
+                int b = contact.b;
+
+                bool aDyn = bodyTypes[a] == BodyType.Dynamic;
+                bool bDyn = bodyTypes[b] == BodyType.Dynamic;
+                if (!aDyn && !bDyn)
+                    continue;
+
+                Pose pa = poses[a];
+                Pose pb = poses[b];
+                ContactPointManifold cps = contact.cps;
+
+                int count = cps.numContactPoints;
+                if (count <= 0)
+                    continue;
+
+                Velocity va = velocities[a];
+                Velocity vb = velocities[b];
+
+                float invMassA = aDyn ? masses[a].invMass : 0f;
+                float invMassB = bDyn ? masses[b].invMass : 0f;
+
+                float3x3 invIworldA = float3x3.zero;
+                float3x3 invIworldB = float3x3.zero;
+
+                if (aDyn)
+                {
+                    float3x3 RA = new float3x3(pa.rotation);
+                    invIworldA = math.mul(RA, math.mul(inertias[a].invInertia, math.transpose(RA)));
+                }
+                if (bDyn)
+                {
+                    float3x3 RB = new float3x3(pb.rotation);
+                    invIworldB = math.mul(RB, math.mul(inertias[b].invInertia, math.transpose(RB)));
+                }
+
+                // Solve per-contact impulses: normal + friction + rolling drag.
+                for (int ci = 0; ci < count; ci++)
+                {
+                    var cp = cps[ci];
+
+                    float3 p = cp.point;
+
+                    // Use the contact's own normal when possible.
+                    float3 n = cp.normal;
+                    float nLenSq = math.lengthsq(n);
+                    if (nLenSq < 1e-12f)
+                        continue;
+                    n *= math.rsqrt(nLenSq);
+
+                    float3 rA = p - pa.position;
+                    float3 rB = p - pb.position;
+
+                    float3 vPointA = va.linearVelocity + math.cross(va.angularVelocity, rA);
+                    float3 vPointB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
+                    float3 vRel = vPointB - vPointA;
+
+                    float vn = math.dot(vRel, n);
+
+                    // Bias is only applied on the first solver iteration.
+                    // With cached contacts, applying full cached depth every iteration can over-correct velocity.
+                    const float beta = 0.2f;
+                    const float allowedPen = 1e-4f;
+                    float biasVel = 0f;
+                    if (applyBias)
+                    {
+                        float pen = math.max(0f, contact.cps.globalPenDepth - allowedPen);
+                        biasVel = (pen > 0f)
+                            ? (beta * pen / math.max(dt, 1e-6f))
+                            : 0f;
+                    }
+
+                    // --- Normal impulse ---
+                    float3 rAxN = math.cross(rA, n);
+                    float3 rBxN = math.cross(rB, n);
+
+                    float3 angA_n = aDyn ? math.cross(math.mul(invIworldA, rAxN), rA) : float3.zero;
+                    float3 angB_n = bDyn ? math.cross(math.mul(invIworldB, rBxN), rB) : float3.zero;
+
+                    float denomN = invMassA + invMassB + math.dot(n, angA_n + angB_n);
+                    if (denomN <= 1e-12f)
                         continue;
 
-                    float3 globalN = cps.globalPenAxis; // A -> B
-                    float depth = cps.globalPenDepth;
-                    if (depth <= kDepthSlop)
-                        continue;
+                    // Restitution only for real impacts.
+                    float e = contact.restitution;
+                    if (-vn < 1.0f) e = 0f;
 
-                    // ---- (1) Global penetration correction (positional only) ----
-                    if (aDyn && bDyn)
-                    {
-                        float3 corr = globalN * (depth * 0.5f);
-                        pa.position -= corr;
-                        pb.position += corr;
-                        poses[a] = pa;
-                        poses[b] = pb;
-                    }
-                    else if (aDyn && !bDyn)
-                    {
-                        pa.position -= globalN * depth;
-                        poses[a] = pa;
-                    }
-                    else if (!aDyn && bDyn)
-                    {
-                        pb.position += globalN * depth;
-                        poses[b] = pb;
-                    }
+                    float jn = (-(1f + e) * vn + biasVel) / denomN;
 
-                    // refresh after correction
-                    pa = poses[a];
-                    pb = poses[b];
+                    // Clamp: no pulling forces.
+                    if (jn < 0f) jn = 0f;
 
-                    int count = cps.numContactPoints;
-                    if (count <= 0)
-                        continue;
-
-                    Velocity va = velocities[a];
-                    Velocity vb = velocities[b];
-
-                    float invMassA = aDyn ? masses[a].invMass : 0f;
-                    float invMassB = bDyn ? masses[b].invMass : 0f;
-
-                    float3x3 invIworldA = float3x3.zero;
-                    float3x3 invIworldB = float3x3.zero;
+                    float3 impulseN = n * jn;
 
                     if (aDyn)
                     {
-                        float3x3 RA = new float3x3(pa.rotation);
-                        invIworldA = math.mul(RA, math.mul(inertias[a].invInertia, math.transpose(RA)));
+                        va.linearVelocity -= impulseN * invMassA;
+                        va.angularVelocity -= math.mul(invIworldA, rAxN * jn);
                     }
                     if (bDyn)
                     {
-                        float3x3 RB = new float3x3(pb.rotation);
-                        invIworldB = math.mul(RB, math.mul(inertias[b].invInertia, math.transpose(RB)));
+                        vb.linearVelocity += impulseN * invMassB;
+                        vb.angularVelocity += math.mul(invIworldB, rBxN * jn);
                     }
 
-                    // Solve per-contact impulses (normal + friction) + rolling �drag�
-                    for (int ci = 0; ci < count; ci++)
+                    // --- Tangential friction impulse ---
+                    // Recompute relative velocity after normal impulse.
+                    vPointA = va.linearVelocity + math.cross(va.angularVelocity, rA);
+                    vPointB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
+                    vRel = vPointB - vPointA;
+
+                    float3 vt = vRel - n * math.dot(vRel, n);
+                    float vtLen = math.length(vt);
+
+                    if (vtLen > 1e-8f)
                     {
-                        var cp = cps[ci];
+                        float3 t = vt / vtLen;
 
-                        float3 p = cp.point;
+                        float3 rAxT = math.cross(rA, t);
+                        float3 rBxT = math.cross(rB, t);
 
-                        // Use the contact�s own normal (better than globalPenAxis for impulses)
-                        float3 n = cp.normal;
-                        float nLenSq = math.lengthsq(n);
-                        if (nLenSq < 1e-12f)
-                            continue;
-                        n *= math.rsqrt(nLenSq);
+                        float3 angA_t = aDyn ? math.cross(math.mul(invIworldA, rAxT), rA) : float3.zero;
+                        float3 angB_t = bDyn ? math.cross(math.mul(invIworldB, rBxT), rB) : float3.zero;
 
-                        float3 rA = p - pa.position;
-                        float3 rB = p - pb.position;
-
-                        float3 vPointA = va.linearVelocity + math.cross(va.angularVelocity, rA);
-                        float3 vPointB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
-                        float3 vRel = vPointB - vPointA;
-
-                        float vn = math.dot(vRel, n);
-
-                        // ---------------- Bias (Baumgarte stabilization) ----------------
-                        const float beta = 0.2f;         // 0.1�0.3 is typical
-                        const float allowedPen = 1e-4f;
-
-                        float pen = math.max(0f, depth - allowedPen);
-                        float biasVel = (pen > 0f)
-                            ? (beta * pen / math.max(dt, 1e-6f))
-                            : 0f;
-                        // ---------------------------------------------------------------
-
-
-                        // --- Normal impulse ---
-                        float3 rAxN = math.cross(rA, n);
-                        float3 rBxN = math.cross(rB, n);
-
-                        float3 angA_n = aDyn ? math.cross(math.mul(invIworldA, rAxN), rA) : float3.zero;
-                        float3 angB_n = bDyn ? math.cross(math.mul(invIworldB, rBxN), rB) : float3.zero;
-
-                        float denomN = invMassA + invMassB + math.dot(n, angA_n + angB_n);
-                        if (denomN <= 1e-12f)
-                            continue;
-
-
-                        // Restitution only for real impacts
-                        float e = restitution;
-                        if (-vn < 1.0f) e = 0f;
-
-
-                        // Solve impulse with bias
-                        float jn = (-(1f + e) * vn + biasVel) / denomN;
-
-
-                        // Clamp (no pulling forces)
-                        if (jn < 0f) jn = 0f;
-
-
-                        float3 impulseN = n * jn;
-
-                        if (aDyn)
+                        float denomT = invMassA + invMassB + math.dot(t, angA_t + angB_t);
+                        if (denomT > 1e-12f)
                         {
-                            va.linearVelocity -= impulseN * invMassA;
-                            va.angularVelocity -= math.mul(invIworldA, rAxN * jn);
-                        }
-                        if (bDyn)
-                        {
-                            vb.linearVelocity += impulseN * invMassB;
-                            vb.angularVelocity += math.mul(invIworldB, rBxN * jn);
-                        }
+                            float jt = -math.dot(vRel, t) / denomT;
 
-                        // --- Tangential (static/dynamic) friction impulse ---
-                        // recompute relative velocity after normal impulse (more stable)
-                        vPointA = va.linearVelocity + math.cross(va.angularVelocity, rA);
-                        vPointB = vb.linearVelocity + math.cross(vb.angularVelocity, rB);
-                        vRel = vPointB - vPointA;
+                            float maxStatic = contact.muS * jn;
+                            float maxDynamic = contact.muD * jn;
+                            float cap = (vtLen < kStaticVelEps) ? maxStatic : maxDynamic;
 
-                        float3 vt = vRel - n * math.dot(vRel, n);
-                        float vtLen = math.length(vt);
+                            jt = math.clamp(jt, -cap, cap);
 
-                        if (vtLen > 1e-8f)
-                        {
-                            float3 t = vt / vtLen; // tangent dir
+                            float3 impulseT = t * jt;
 
-                            float3 rAxT = math.cross(rA, t);
-                            float3 rBxT = math.cross(rB, t);
-
-                            float3 angA_t = aDyn ? math.cross(math.mul(invIworldA, rAxT), rA) : float3.zero;
-                            float3 angB_t = bDyn ? math.cross(math.mul(invIworldB, rBxT), rB) : float3.zero;
-
-                            float denomT = invMassA + invMassB + math.dot(t, angA_t + angB_t);
-                            if (denomT > 1e-12f)
-                            {
-                                float jt = -math.dot(vRel, t) / denomT;
-
-                                // Static vs dynamic: if we're �almost resting�, allow bigger (static) cap,
-                                // otherwise use dynamic cap.
-                                float maxStatic = muS * jn;
-                                float maxDynamic = muD * jn;
-
-                                float cap = (vtLen < kStaticVelEps) ? maxStatic : maxDynamic;
-
-                                jt = math.clamp(jt, -cap, cap);
-
-                                float3 impulseT = t * jt;
-
-                                if (aDyn)
-                                {
-                                    va.linearVelocity -= impulseT * invMassA;
-                                    va.angularVelocity -= math.mul(invIworldA, rAxT * jt);
-                                }
-                                if (bDyn)
-                                {
-                                    vb.linearVelocity += impulseT * invMassB;
-                                    vb.angularVelocity += math.mul(invIworldB, rBxT * jt);
-                                }
-                            }
-                        }
-
-                        // --- Rolling friction (cheap, contact-based angular damping) ---
-                        // Treat muR as �angular drag per unit normal impulse�.
-                        // This is not a perfect model, but feels right and is stable.
-                        if (muR > 0f && jn > 0f)
-                        {
-                            float k = muR * jn; // scale with contact strength
                             if (aDyn)
                             {
-                                float wLen = math.length(va.angularVelocity);
-                                if (wLen > kRollEps)
-                                {
-                                    float3 wDir = va.angularVelocity / wLen;
-                                    float wNew = math.max(0f, wLen - k);
-                                    va.angularVelocity = wDir * wNew;
-                                }
+                                va.linearVelocity -= impulseT * invMassA;
+                                va.angularVelocity -= math.mul(invIworldA, rAxT * jt);
                             }
                             if (bDyn)
                             {
-                                float wLen = math.length(vb.angularVelocity);
-                                if (wLen > kRollEps)
-                                {
-                                    float3 wDir = vb.angularVelocity / wLen;
-                                    float wNew = math.max(0f, wLen - k);
-                                    vb.angularVelocity = wDir * wNew;
-                                }
+                                vb.linearVelocity += impulseT * invMassB;
+                                vb.angularVelocity += math.mul(invIworldB, rBxT * jt);
                             }
                         }
                     }
+
+                    // --- Rolling friction ---
+                    if (contact.muR > 0f && jn > 0f)
+                    {
+                        float k = contact.muR * jn;
+                        if (aDyn)
+                        {
+                            float wLen = math.length(va.angularVelocity);
+                            if (wLen > kRollEps)
+                            {
+                                float3 wDir = va.angularVelocity / wLen;
+                                float wNew = math.max(0f, wLen - k);
+                                va.angularVelocity = wDir * wNew;
+                            }
+                        }
+                        if (bDyn)
+                        {
+                            float wLen = math.length(vb.angularVelocity);
+                            if (wLen > kRollEps)
+                            {
+                                float3 wDir = vb.angularVelocity / wLen;
+                                float wNew = math.max(0f, wLen - k);
+                                vb.angularVelocity = wDir * wNew;
+                            }
+                        }
+                    }
+                }
 
                 velocities[a] = va;
                 velocities[b] = vb;
