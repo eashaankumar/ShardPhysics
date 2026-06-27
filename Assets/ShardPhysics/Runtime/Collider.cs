@@ -11,8 +11,9 @@ namespace Shard.Runtime
         Cylinder,
         Cone,
         Mesh,
+        Triangle,
+        TriangleMesh,
         Voxel
-        // later: Convex, Mesh, Voxel, Heightfield...
     }
 
     public struct ShardColliderMaterial
@@ -26,15 +27,18 @@ namespace Shard.Runtime
     public struct ShardCollider
     {
         public ShardColliderType type;
-
         public ShardColliderMaterial material;
 
-        public Pose localPose;     // collider pose relative to body frame (body origin)
-        public float density;      // optional; OR use body mass distribution later
+        public Pose localPose;
+        public float density;
 
-        // Shape params (use only what type needs)
-        public float radius;       // sphere/capsule
-        public float3 halfExtents; // box
-        public float height;       // capsule (cylinder height, excluding hemispheres, define your convention)
+        public float radius;
+        public float3 halfExtents;
+        public float height;
+
+        public float3 vertexA;
+        public float3 vertexB;
+        public float3 vertexC;
+        public int meshIndex;
     }
 }
