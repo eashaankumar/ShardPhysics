@@ -366,6 +366,13 @@ namespace Shard.Runtime.Solvers
         {
             manifold = default;
 
+            // First try a terrain-friendly face contact path. This catches the most common
+            // box-vs-heightfield case: one or more box vertices pass through the triangle plane.
+            // The old SAT-only path could report tiny/unstable depths for coplanar triangle faces,
+            // which let cubes fall through terrain while spheres/capsules still worked.
+            if (TrySolveBoxTriangleVertexPlaneContacts(box, triangle, out manifold))
+                return true;
+
             // Work in box-local space: box is centered at origin, axes are world-aligned,
             // triangle is transformed into that space.
             Triangle localTriangle = new Triangle(
@@ -424,17 +431,120 @@ namespace Shard.Runtime.Solvers
 
             float3 triCentroidLocal = (localTriangle.a + localTriangle.b + localTriangle.c) / 3f;
 
-            // Normal must point from A -> B.
-            // A is box, B is triangle.
+            // Normal must point from A -> B. A is box, B is triangle.
             if (math.dot(bestAxisLocal, triCentroidLocal) < 0f)
                 bestAxisLocal = -bestAxisLocal;
 
             float3 normalWorld = math.normalize(math.mul(box.rotation, bestAxisLocal));
-
             float3 pointWorld = FindBoxTriangleContactPoint(box, triangle);
 
-            SetSingleContact(ref manifold, pointWorld, normalWorld, bestOverlap);
+            SetSingleContact(ref manifold, pointWorld, normalWorld, math.max(bestOverlap, 0.001f));
             return true;
+        }
+
+        private static bool TrySolveBoxTriangleVertexPlaneContacts(
+            Box box,
+            Triangle triangle,
+            out ContactPointManifold manifold)
+        {
+            manifold = default;
+
+            float3 triNormal = TriangleNormal(triangle);
+            float3 triCenter = (triangle.a + triangle.b + triangle.c) / 3f;
+
+            // Contact normal must point from box -> triangle.
+            float3 normal = triNormal;
+            if (math.dot(normal, triCenter - box.center) < 0f)
+                normal = -normal;
+
+            const float contactSlop = 0.025f;
+            const float minDepth = 0.001f;
+
+            float deepest = 0f;
+
+            for (int i = 0; i < 8; i++)
+            {
+                float3 vertex = GetBoxVertexWorld(box, i);
+                float signedDepth = math.dot(vertex - triangle.a, normal);
+
+                // signedDepth > 0 means the box vertex has crossed the triangle plane
+                // in the box->triangle direction. Allow a small slop to create a contact
+                // before numerical integration tunnels fully through the zero-thickness face.
+                if (signedDepth < -contactSlop)
+                    continue;
+
+                float3 projected = vertex - normal * signedDepth;
+
+                if (!PointInTriangle(projected, triangle.a, triangle.b, triangle.c))
+                    continue;
+
+                float depth = math.max(signedDepth, minDepth);
+                AddBoxTriangleContact(ref manifold, projected, normal, depth);
+                deepest = math.max(deepest, depth);
+
+                if (manifold.numContactPoints == 4)
+                    break;
+            }
+
+            if (manifold.numContactPoints == 0)
+                return false;
+
+            manifold.globalPenAxis = normal;
+            manifold.globalPenDepth = math.max(deepest, minDepth);
+
+            for (int i = 0; i < manifold.numContactPoints; i++)
+            {
+                ContactPoint cp = manifold[i];
+                cp.normal = normal;
+                cp.depth = manifold.globalPenDepth;
+                manifold[i] = cp;
+            }
+
+            return true;
+        }
+
+        private static void AddBoxTriangleContact(
+            ref ContactPointManifold manifold,
+            float3 point,
+            float3 normal,
+            float depth)
+        {
+            int index = manifold.numContactPoints;
+            if (index >= 4)
+                return;
+
+            manifold[index] = new ContactPoint
+            {
+                point = point,
+                normal = normal,
+                depth = depth
+            };
+
+            manifold.numContactPoints = index + 1;
+        }
+
+        private static bool PointInTriangle(float3 p, float3 a, float3 b, float3 c)
+        {
+            float3 v0 = c - a;
+            float3 v1 = b - a;
+            float3 v2 = p - a;
+
+            float dot00 = math.dot(v0, v0);
+            float dot01 = math.dot(v0, v1);
+            float dot02 = math.dot(v0, v2);
+            float dot11 = math.dot(v1, v1);
+            float dot12 = math.dot(v1, v2);
+
+            float denom = dot00 * dot11 - dot01 * dot01;
+            if (math.abs(denom) < EPSILON)
+                return false;
+
+            float invDenom = 1f / denom;
+            float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+            float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+
+            const float eps = 1e-4f;
+            return u >= -eps && v >= -eps && u + v <= 1f + eps;
         }
 
         public static bool SolveTriangleBox(Triangle triangle, Box box, out ContactPointManifold manifold)
