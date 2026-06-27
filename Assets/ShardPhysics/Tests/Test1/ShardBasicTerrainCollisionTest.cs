@@ -100,7 +100,8 @@ namespace Shard.Tests.Test1
 
                     GameObject go = new GameObject($"Shard Terrain Chunk {x},{z}");
                     go.transform.SetParent(transform, false);
-
+                    go.transform.position = origin;
+                    
                     MeshFilter filter = go.AddComponent<MeshFilter>();
                     MeshRenderer renderer = go.AddComponent<MeshRenderer>();
 
@@ -117,7 +118,7 @@ namespace Shard.Tests.Test1
 
                     CreateStaticBody(new Pose
                     {
-                        position = float3.zero,
+                        position = origin,
                         rotation = quaternion.identity
                     }, collider);
                 }
@@ -146,7 +147,7 @@ namespace Shard.Tests.Test1
                     float h = noise.snoise(new float2(worldX, worldZ) * noiseScale) * heightScale;
 
                     int index = z * vertsPerSide + x;
-                    vertices[index] = new Vector3(worldX, h, worldZ);
+                    vertices[index] = new Vector3(u * chunkSize, h, v * chunkSize);
                 }
             }
 
