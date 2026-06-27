@@ -20,25 +20,24 @@ namespace Shard.Runtime
 
     public sealed class Broadphase : IDisposable
     {
-        private NativeList<Aabb> _bodyAabbs;
-        private NativeList<byte> _hasBodyAabb;
-        private NativeList<ShardBodyPair> _pairs;
+        private NativeList<Aabb> bodyAabbs;
+        private NativeList<byte> hasBodyAabb;
+        private NativeList<ShardBodyPair> pairs;
 
-        public NativeArray<ShardBodyPair>.ReadOnly Pairs => _pairs.AsArray().AsReadOnly();
-        public int PairCount => _pairs.Length;
+        public int PairCount => pairs.Length;
 
         public Broadphase(int initialBodyCapacity, Allocator allocator)
         {
-            _bodyAabbs = new NativeList<Aabb>(initialBodyCapacity, allocator);
-            _hasBodyAabb = new NativeList<byte>(initialBodyCapacity, allocator);
-            _pairs = new NativeList<ShardBodyPair>(math.max(16, initialBodyCapacity * 2), allocator);
+            bodyAabbs = new NativeList<Aabb>(initialBodyCapacity, allocator);
+            hasBodyAabb = new NativeList<byte>(initialBodyCapacity, allocator);
+            pairs = new NativeList<ShardBodyPair>(math.max(16, initialBodyCapacity * 2), allocator);
         }
 
         public void Dispose()
         {
-            if (_bodyAabbs.IsCreated) _bodyAabbs.Dispose();
-            if (_hasBodyAabb.IsCreated) _hasBodyAabb.Dispose();
-            if (_pairs.IsCreated) _pairs.Dispose();
+            if (bodyAabbs.IsCreated) bodyAabbs.Dispose();
+            if (hasBodyAabb.IsCreated) hasBodyAabb.Dispose();
+            if (pairs.IsCreated) pairs.Dispose();
         }
 
         public void Rebuild(
@@ -49,42 +48,43 @@ namespace Shard.Runtime
         {
             int bodyCount = poses.Length;
 
-            _bodyAabbs.ResizeUninitialized(bodyCount);
-            _hasBodyAabb.ResizeUninitialized(bodyCount);
-            _pairs.Clear();
+            bodyAabbs.ResizeUninitialized(bodyCount);
+            hasBodyAabb.ResizeUninitialized(bodyCount);
+            pairs.Clear();
 
             for (int i = 0; i < bodyCount; i++)
             {
                 if (ComputeBodyAabb(i, poses[i], colliderStore, triangleMeshStore, out Aabb aabb))
                 {
-                    _bodyAabbs[i] = aabb;
-                    _hasBodyAabb[i] = 1;
+                    bodyAabbs[i] = aabb;
+                    hasBodyAabb[i] = 1;
                 }
                 else
                 {
-                    _bodyAabbs[i] = default;
-                    _hasBodyAabb[i] = 0;
+                    bodyAabbs[i] = default;
+                    hasBodyAabb[i] = 0;
                 }
             }
 
             for (int a = 0; a < bodyCount; a++)
             {
-                if (_hasBodyAabb[a] == 0)
+                if (hasBodyAabb[a] == 0)
                     continue;
 
-                bool aDyn = bodyTypes[a] == BodyType.Dynamic;
+                bool aDynamic = bodyTypes[a] == BodyType.Dynamic;
 
                 for (int b = a + 1; b < bodyCount; b++)
                 {
-                    if (_hasBodyAabb[b] == 0)
+                    if (hasBodyAabb[b] == 0)
                         continue;
 
-                    bool bDyn = bodyTypes[b] == BodyType.Dynamic;
-                    if (!aDyn && !bDyn)
+                    bool bDynamic = bodyTypes[b] == BodyType.Dynamic;
+
+                    if (!aDynamic && !bDynamic)
                         continue;
 
-                    if (_bodyAabbs[a].Overlaps(_bodyAabbs[b]))
-                        _pairs.Add(new ShardBodyPair(a, b));
+                    if (bodyAabbs[a].Overlaps(bodyAabbs[b]))
+                        pairs.Add(new ShardBodyPair(a, b));
                 }
             }
         }
@@ -92,7 +92,7 @@ namespace Shard.Runtime
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ShardBodyPair GetPair(int index)
         {
-            return _pairs[index];
+            return pairs[index];
         }
 
         private static bool ComputeBodyAabb(
@@ -103,9 +103,10 @@ namespace Shard.Runtime
             out Aabb bodyAabb)
         {
             bodyAabb = Aabb.Empty;
-            bool hasAny = false;
+            bool hasAnyCollider = false;
 
             int node = colliderStore.GetHead(denseBodyIndex);
+
             while (node != -1)
             {
                 if (!colliderStore.TryGetNode(node, out ShardCollider collider, out int next))
@@ -115,13 +116,13 @@ namespace Shard.Runtime
                 {
                     bodyAabb.min = math.min(bodyAabb.min, colliderAabb.min);
                     bodyAabb.max = math.max(bodyAabb.max, colliderAabb.max);
-                    hasAny = true;
+                    hasAnyCollider = true;
                 }
 
                 node = next;
             }
 
-            return hasAny;
+            return hasAnyCollider;
         }
 
         private static bool ComputeColliderAabb(
@@ -130,51 +131,70 @@ namespace Shard.Runtime
             ShardTriangleMeshStore triangleMeshStore,
             out Aabb aabb)
         {
-            Pose worldPose = ComposePoseSafe(bodyPose, collider.localPose);
+            Pose worldPose = ComposePose(bodyPose, collider.localPose);
 
             switch (collider.type)
             {
                 case ShardColliderType.Sphere:
-                    aabb = FromCenterExtents(worldPose.position, new float3(math.max(0f, collider.radius)));
+                {
+                    float r = math.max(0f, collider.radius);
+                    aabb = FromCenterExtents(worldPose.position, new float3(r));
                     return true;
+                }
 
                 case ShardColliderType.Box:
-                    aabb = FromOrientedBox(worldPose.position, worldPose.rotation, math.max(collider.halfExtents, float3.zero));
+                {
+                    float3 half = math.max(collider.halfExtents, float3.zero);
+                    aabb = FromOrientedBox(worldPose.position, worldPose.rotation, half);
                     return true;
+                }
 
                 case ShardColliderType.Capsule:
                 case ShardColliderType.Cylinder:
                 case ShardColliderType.Cone:
+                {
+                    float halfHeight = math.max(0f, collider.height * 0.5f);
+                    float radius = math.max(0f, collider.radius);
+
                     aabb = FromVerticalSweptRadius(
                         worldPose.position,
                         worldPose.rotation,
-                        math.max(0f, collider.height * 0.5f),
-                        math.max(0f, collider.radius));
+                        halfHeight,
+                        radius);
+
                     return true;
+                }
 
                 case ShardColliderType.Triangle:
+                {
                     aabb = Aabb.Empty;
                     aabb.Encapsulate(TransformPoint(worldPose, collider.vertexA));
                     aabb.Encapsulate(TransformPoint(worldPose, collider.vertexB));
                     aabb.Encapsulate(TransformPoint(worldPose, collider.vertexC));
                     return true;
+                }
 
                 case ShardColliderType.Mesh:
+                {
                     if (!triangleMeshStore.TryGetMeshInfo(collider.meshIndex, out ShardTriangleMeshInfo meshInfo))
                     {
                         aabb = default;
                         return false;
                     }
 
-                    aabb = TransformAabb(meshInfo.localBounds, worldPose);
+                    aabb = TransformLocalAabb(meshInfo.localBounds, worldPose);
                     return true;
+                }
 
                 default:
+                {
                     aabb = default;
                     return false;
+                }
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Aabb FromCenterExtents(float3 center, float3 extents)
         {
             return new Aabb(center - extents, center + extents);
@@ -182,7 +202,7 @@ namespace Shard.Runtime
 
         private static Aabb FromOrientedBox(float3 center, quaternion rotation, float3 halfExtents)
         {
-            float3x3 r = new float3x3(SanitizeRotation(rotation));
+            float3x3 r = new float3x3(rotation);
 
             float3 worldExtents =
                 math.abs(r.c0) * halfExtents.x +
@@ -192,42 +212,38 @@ namespace Shard.Runtime
             return FromCenterExtents(center, worldExtents);
         }
 
-        private static Aabb FromVerticalSweptRadius(float3 center, quaternion rotation, float halfHeight, float radius)
+        private static Aabb FromVerticalSweptRadius(
+            float3 center,
+            quaternion rotation,
+            float halfHeight,
+            float radius)
         {
-            quaternion q = SanitizeRotation(rotation);
-            float3 axis = math.mul(q, new float3(0f, 1f, 0f));
+            float3 axis = math.mul(rotation, new float3(0f, 1f, 0f));
             float3 extents = math.abs(axis) * halfHeight + new float3(radius);
 
             return FromCenterExtents(center, extents);
         }
 
-        private static Aabb TransformAabb(Aabb localAabb, Pose pose)
+        private static Aabb TransformLocalAabb(Aabb localAabb, Pose worldPose)
         {
-            float3 worldCenter = TransformPoint(pose, localAabb.Center);
-            return FromOrientedBox(worldCenter, pose.rotation, localAabb.Extents);
+            float3 center = TransformPoint(worldPose, localAabb.Center);
+            return FromOrientedBox(center, worldPose.rotation, localAabb.Extents);
         }
 
-        private static Pose ComposePoseSafe(Pose bodyPose, Pose localPose)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Pose ComposePose(Pose bodyPose, Pose localPose)
         {
-            quaternion bodyRot = SanitizeRotation(bodyPose.rotation);
-            quaternion localRot = SanitizeRotation(localPose.rotation);
-
             return new Pose
             {
-                position = bodyPose.position + math.mul(bodyRot, localPose.position),
-                rotation = math.mul(bodyRot, localRot)
+                position = bodyPose.position + math.mul(bodyPose.rotation, localPose.position),
+                rotation = math.mul(bodyPose.rotation, localPose.rotation)
             };
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static float3 TransformPoint(Pose pose, float3 localPoint)
         {
-            return pose.position + math.mul(SanitizeRotation(pose.rotation), localPoint);
-        }
-
-        private static quaternion SanitizeRotation(quaternion q)
-        {
-            float lenSq = math.lengthsq(q.value);
-            return lenSq > 1e-12f ? math.normalize(q) : quaternion.identity;
+            return pose.position + math.mul(pose.rotation, localPoint);
         }
     }
 }
