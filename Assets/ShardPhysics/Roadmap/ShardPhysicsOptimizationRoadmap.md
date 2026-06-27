@@ -4,27 +4,32 @@
 
 The engine now performs:
 
-1.  **Body-level broadphase** using world-space AABBs to reject
-    non-overlapping body pairs.
-2.  Narrowphase collision detection only for candidate body pairs.
-3.  TriangleMesh collisions use a **TriangleMesh BVH** to query only
+1.  **Spatial-hash body broadphase** using world-space AABBs to reject
+    non-overlapping body pairs without brute-forcing every body against
+    every other body in large scenes.
+2.  A small-scene **brute-force AABB fallback** for low body counts where
+    hash setup overhead is not worth it.
+3.  Oversized-AABB fallback handling for very large bodies, terrain-like
+    bodies, or objects that would occupy too many spatial hash cells.
+4.  Narrowphase collision detection only for candidate body pairs.
+5.  TriangleMesh collisions use a **TriangleMesh BVH** to query only
     nearby triangles before narrowphase.
-4.  Candidate triangles then pass through a **triangle AABB prefilter**
+6.  Candidate triangles then pass through a **triangle AABB prefilter**
     before primitive-vs-triangle narrowphase.
-5.  **Collision detection runs once per simulation substep instead of
+7.  **Collision detection runs once per simulation substep instead of
     once per solver iteration.**
-6.  **Generated contact manifolds are cached and reused across every
+8.  **Generated contact manifolds are cached and reused across every
     solver iteration.**
-7.  **Broadphase and narrowphase are no longer repeatedly executed
+9.  **Broadphase and narrowphase are no longer repeatedly executed
     during iterative impulse solving.**
-8.  Box↔Mesh collision now works through robust Box↔Triangle contacts.
-9.  Box↔Mesh collision supports terrain-style surfaces, vertical walls,
+10. Box↔Mesh collision now works through robust Box↔Triangle contacts.
+11. Box↔Mesh collision supports terrain-style surfaces, vertical walls,
     corners, edges, and thin triangle cases.
-10. The entire collision pipeline remains **NativeMemory-based**, with
+12. The entire collision pipeline remains **NativeMemory-based**, with
     no managed allocations during simulation.
-11. Built-in **performance instrumentation** tracks BVH efficiency and
+13. Built-in **performance instrumentation** tracks BVH efficiency and
     collision pipeline statistics.
-12. Permanent regression tests verify BVH effectiveness and help catch
+14. Permanent regression tests verify BVH effectiveness and help catch
     future performance regressions.
 
 Current collision pipeline:
@@ -32,7 +37,7 @@ Current collision pipeline:
 ``` text
 Simulation Substep
 
-Body Broadphase
+Spatial Hash Body Broadphase
         ↓
 TriangleMesh BVH Query
         ↓
@@ -53,7 +58,9 @@ Solver Iteration 6
 Collision detection is now separated from constraint solving. Contacts
 are generated once, cached, and reused throughout the solver iterations.
 Triangle meshes are spatially accelerated using a BVH before
-narrowphase, greatly reducing unnecessary triangle testing.
+narrowphase, greatly reducing unnecessary triangle testing. Large body
+sets are now accelerated with a spatial hash broadphase before
+narrowphase, reducing unnecessary body-pair checks.
 
 ------------------------------------------------------------------------
 
@@ -259,19 +266,83 @@ Benefits:
 -   Validate optimization improvements
 -   Guide future tuning
 
-# Step 7 --- Future Broadphase Improvements
+------------------------------------------------------------------------
 
-After the engine is stable:
+# Step 7 --- Spatial Hash Body Broadphase
 
--   Spatial hash grid
+The body broadphase has been upgraded from simple brute-force AABB pair
+checking to a spatial hash grid for larger scenes.
+
+Previous body broadphase:
+
+``` text
+for each body A
+    for each body B after A
+        skip static-static
+        test AABB overlap
+        emit candidate pair
+```
+
+This was still **O(n²)** over bodies, even though it avoided expensive
+narrowphase work for non-overlapping AABBs.
+
+Current body broadphase:
+
+``` text
+Body AABB
+      ↓
+Insert body into spatial hash cells
+      ↓
+Query nearby bodies sharing cells
+      ↓
+Suppress duplicate pairs
+      ↓
+Final AABB overlap check
+      ↓
+Emit candidate body pair
+```
+
+Completed:
+
+-   ~~Spatial hash body broadphase~~
+-   ~~Small-scene brute-force fallback~~
+-   ~~Oversized-AABB fallback for huge bodies / terrain-like bodies~~
+-   ~~Duplicate pair suppression~~
+-   ~~Final AABB overlap validation after hash lookup~~
+-   ~~Static-static pair rejection~~
+-   ~~Existing Broadphase API preserved~~
+
+Benefits:
+
+-   Reduces body-pair broadphase cost in large scenes
+-   Avoids brute-forcing every dynamic body against every other body
+-   Keeps the cheaper brute-force path for small scenes
+-   Handles huge terrain bodies without exploding hash-cell insertion
+-   Preserves the existing collision pipeline structure
+
+Remaining improvements:
+
+-   Benchmark broadphase scalability
+-   Tune spatial hash cell size
+-   Add broadphase counters for hash cell occupancy
+-   Add regression tests for duplicate pair suppression
+-   Add regression tests for oversized-body fallback
+-   Compare spatial hash against Sweep and Prune for long, flat worlds
+
+------------------------------------------------------------------------
+
+# Step 8 --- Future Broadphase Improvements
+
+After the spatial hash broadphase is stable and profiled:
+
 -   Sweep and Prune (SAP)
 -   Dynamic AABB Tree
 -   Pair cache
 -   Incremental broadphase updates
 -   Sharded multithreaded broadphase
 
-These would replace the current simple body-AABB broadphase for large
-dynamic scenes.
+These would only replace or supplement the spatial hash if profiling
+shows the hash grid is not ideal for a specific scene type.
 
 ------------------------------------------------------------------------
 
@@ -284,8 +355,14 @@ dynamic scenes.
 5.  ~~Box↔Mesh robustness~~
 6.  ~~TriangleMesh BVH~~
 7.  ~~Performance instrumentation & regression testing~~
-8.  ➜ BVH optimization (SAH / tuning / profiling)
-9.  ➜ Advanced body broadphase (Grid / SAP / Dynamic AABB Tree)
+8.  ~~Spatial hash body broadphase~~
+9.  ➜ Multi-contact manifold clipping
+10. ➜ Contact reduction / prioritization
+11. ➜ Additional arbitrary mesh stress testing
+12. ➜ Spatial hash benchmarking and tuning
+13. ➜ BVH optimization (SAH / tuning / profiling)
+14. ➜ Sleeping and island management
+15. ➜ Future broadphase alternatives if profiling justifies them
 
 ------------------------------------------------------------------------
 
@@ -301,6 +378,11 @@ dynamic scenes.
 -   ~~Candidate body pair generation~~
 -   ~~Skip static-static body pairs~~
 -   ~~Broadphase integration~~
+-   ~~Spatial hash grid broadphase~~
+-   ~~Small-scene brute-force fallback~~
+-   ~~Oversized-AABB fallback~~
+-   ~~Duplicate body-pair suppression~~
+-   ~~Final AABB overlap check after hash lookup~~
 
 ### TriangleMesh
 
@@ -336,6 +418,14 @@ dynamic scenes.
 -   ~~Improved terrain collision~~
 -   ~~Improved wall, corner, and thin triangle support~~
 
+### Performance
+
+-   ~~Permanent physics performance counters~~
+-   ~~BVH query statistics~~
+-   ~~Candidate triangle statistics~~
+-   ~~Triangle narrowphase statistics~~
+-   ~~Automated BVH regression tests~~
+
 ------------------------------------------------------------------------
 
 ## Remaining
@@ -345,6 +435,15 @@ dynamic scenes.
 -   Multi-contact manifold clipping
 -   Contact reduction / prioritization
 -   Additional arbitrary mesh stress testing
+
+### Broadphase
+
+-   Benchmark spatial hash broadphase scalability
+-   Tune spatial hash cell size
+-   Add spatial hash occupancy counters
+-   Add duplicate-pair regression tests
+-   Add oversized-body fallback regression tests
+-   Compare spatial hash against SAP for long, flat worlds
 
 ### TriangleMesh BVH
 
@@ -356,26 +455,24 @@ dynamic scenes.
 -   Tune leaf size
 -   Performance profiling
 
-### Performance
+### Future Broadphase
 
--   ~~Permanent physics performance counters~~
--   ~~BVH query statistics~~
--   ~~Candidate triangle statistics~~
--   ~~Triangle narrowphase statistics~~
--   ~~Automated BVH regression tests~~
-
-### Advanced Broadphase
-
--   Spatial hash grid
 -   Sweep and Prune (SAP)
 -   Dynamic AABB Tree
 -   Pair cache
 -   Incremental updates
 -   Multithreaded broadphase
 
+### Solver / Simulation Scale
+
+-   Sleeping
+-   Island management
+-   Wake/sleep propagation
+-   Skip inactive islands
+
 ### Performance
 
--   Benchmark broadphase scalability
 -   Compare BVH against previous full triangle scan
 -   Profile large terrain performance
 -   Tune BVH leaf size using collected statistics
+-   Profile spatial hash performance across dense and sparse scenes
