@@ -1468,12 +1468,13 @@ namespace Shard.Runtime
             int meshIndex,
             ShardTriangleMeshInfo meshInfo,
             Pose meshWorldPose,
-            out ContactPointManifold bestManifold)
+            out ContactPointManifold manifold)
         {
-            bestManifold = default;
+            manifold = default;
 
             bool hit = false;
-            float bestDepth = float.NegativeInfinity;
+            float deepest = float.NegativeInfinity;
+            float3 accumulatedNormal = float3.zero;
 
             for (int i = 0; i < meshInfo.triangleCount; i++)
             {
@@ -1487,32 +1488,102 @@ namespace Shard.Runtime
                         sphere,
                         worldTriangle,
                         out ContactPointManifold candidate))
-                {
                     continue;
-                }
 
-                if (!hit || candidate.globalPenDepth > bestDepth)
+                hit = true;
+                deepest = math.max(deepest, candidate.globalPenDepth);
+                accumulatedNormal += candidate.globalPenAxis * math.max(candidate.globalPenDepth, 0.0001f);
+
+                AddTriangleMeshCandidateContact(ref manifold, candidate.p1);
+            }
+
+            if (!hit)
+                return false;
+
+            manifold.globalPenDepth = deepest;
+            manifold.globalPenAxis = NormalizeOrFallback(accumulatedNormal, new float3(0f, 1f, 0f));
+
+            NormalizeTriangleMeshContactNormals(ref manifold, manifold.globalPenAxis);
+            return true;
+        }
+        
+        private static void AddTriangleMeshCandidateContact(
+            ref ContactPointManifold manifold,
+            ContactPoint contact)
+        {
+            const float duplicateDistanceSq = 0.0001f;
+
+            for (int i = 0; i < manifold.numContactPoints; i++)
+            {
+                ContactPoint existing = manifold[i];
+
+                if (math.lengthsq(existing.point - contact.point) < duplicateDistanceSq)
                 {
-                    hit = true;
-                    bestDepth = candidate.globalPenDepth;
-                    bestManifold = candidate;
+                    if (contact.depth > existing.depth)
+                        manifold[i] = contact;
+
+                    return;
                 }
             }
 
-            return hit;
+            if (manifold.numContactPoints < 4)
+            {
+                manifold[manifold.numContactPoints] = contact;
+                manifold.numContactPoints++;
+                return;
+            }
+
+            int shallowestIndex = 0;
+            float shallowestDepth = manifold[0].depth;
+
+            for (int i = 1; i < 4; i++)
+            {
+                if (manifold[i].depth < shallowestDepth)
+                {
+                    shallowestDepth = manifold[i].depth;
+                    shallowestIndex = i;
+                }
+            }
+
+            if (contact.depth > shallowestDepth)
+                manifold[shallowestIndex] = contact;
         }
-        
+
+        private static void NormalizeTriangleMeshContactNormals(
+            ref ContactPointManifold manifold,
+            float3 normal)
+        {
+            for (int i = 0; i < manifold.numContactPoints; i++)
+            {
+                ContactPoint cp = manifold[i];
+                cp.normal = normal;
+                manifold[i] = cp;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float3 NormalizeOrFallback(float3 v, float3 fallback)
+        {
+            float lenSq = math.lengthsq(v);
+
+            if (lenSq < 1e-8f)
+                return fallback;
+
+            return v * math.rsqrt(lenSq);
+        }
+
         private bool SolveBoxTriangleMesh(
             SimpleShapeSolvers.Box box,
             int meshIndex,
             ShardTriangleMeshInfo meshInfo,
             Pose meshWorldPose,
-            out ContactPointManifold bestManifold)
+            out ContactPointManifold manifold)
         {
-            bestManifold = default;
+            manifold = default;
 
             bool hit = false;
-            float bestDepth = float.NegativeInfinity;
+            float deepest = float.NegativeInfinity;
+            float3 accumulatedNormal = float3.zero;
 
             for (int i = 0; i < meshInfo.triangleCount; i++)
             {
@@ -1528,15 +1599,22 @@ namespace Shard.Runtime
                         out ContactPointManifold candidate))
                     continue;
 
-                if (!hit || candidate.globalPenDepth > bestDepth)
-                {
-                    hit = true;
-                    bestDepth = candidate.globalPenDepth;
-                    bestManifold = candidate;
-                }
+                hit = true;
+                deepest = math.max(deepest, candidate.globalPenDepth);
+                accumulatedNormal += candidate.globalPenAxis * math.max(candidate.globalPenDepth, 0.0001f);
+
+                for (int c = 0; c < candidate.numContactPoints; c++)
+                    AddTriangleMeshCandidateContact(ref manifold, candidate[c]);
             }
 
-            return hit;
+            if (!hit)
+                return false;
+
+            manifold.globalPenDepth = deepest;
+            manifold.globalPenAxis = NormalizeOrFallback(accumulatedNormal, new float3(0f, 1f, 0f));
+
+            NormalizeTriangleMeshContactNormals(ref manifold, manifold.globalPenAxis);
+            return true;
         }
 
         private bool SolveCapsuleTriangleMesh(
@@ -1544,12 +1622,13 @@ namespace Shard.Runtime
             int meshIndex,
             ShardTriangleMeshInfo meshInfo,
             Pose meshWorldPose,
-            out ContactPointManifold bestManifold)
+            out ContactPointManifold manifold)
         {
-            bestManifold = default;
+            manifold = default;
 
             bool hit = false;
-            float bestDepth = float.NegativeInfinity;
+            float deepest = float.NegativeInfinity;
+            float3 accumulatedNormal = float3.zero;
 
             for (int i = 0; i < meshInfo.triangleCount; i++)
             {
@@ -1563,19 +1642,23 @@ namespace Shard.Runtime
                         capsule,
                         worldTriangle,
                         out ContactPointManifold candidate))
-                {
                     continue;
-                }
 
-                if (!hit || candidate.globalPenDepth > bestDepth)
-                {
-                    hit = true;
-                    bestDepth = candidate.globalPenDepth;
-                    bestManifold = candidate;
-                }
+                hit = true;
+                deepest = math.max(deepest, candidate.globalPenDepth);
+                accumulatedNormal += candidate.globalPenAxis * math.max(candidate.globalPenDepth, 0.0001f);
+
+                AddTriangleMeshCandidateContact(ref manifold, candidate.p1);
             }
 
-            return hit;
+            if (!hit)
+                return false;
+
+            manifold.globalPenDepth = deepest;
+            manifold.globalPenAxis = NormalizeOrFallback(accumulatedNormal, new float3(0f, 1f, 0f));
+
+            NormalizeTriangleMeshContactNormals(ref manifold, manifold.globalPenAxis);
+            return true;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
