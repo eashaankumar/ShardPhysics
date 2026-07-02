@@ -153,15 +153,15 @@ MonoBehaviour:
   boxMaterial: {fileID: 2100000, guid: 9c778cb3105c0e147aae0cef5ca2fe92, type: 2}
   capsuleMaterial: {fileID: 2100000, guid: ffa524bd406c3b548a4e89f839fea1ba, type: 2}
   triangleMaterial: {fileID: 2100000, guid: a7c118b2f0d524a77a282cca9c769ab7, type: 2}
-  chunksX: 3
-  chunksZ: 3
+  chunksX: 50
+  chunksZ: 10
   chunkResolution: 8
-  chunkSize: 8
+  chunkSize: 10
   heightScale: 1.5
   noiseScale: 0.12
-  sphereCount: 6
-  boxCount: 6
-  capsuleCount: 6
+  sphereCount: 100
+  boxCount: 100
+  capsuleCount: 100
   spawnHeight: 8
   fixedDt: 0.016666668
 --- !u!4 &167918956
@@ -587,7 +587,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &657872138
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -820,7 +820,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &823551366
 Transform:
   m_ObjectHideFlags: 0
